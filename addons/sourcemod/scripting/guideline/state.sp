@@ -17,9 +17,11 @@ float gF_GLWantRouteTime[MAXPLAYERS + 1]; // wantRoute 置位时间（重试间�
 
 void GL_OnMapStart_State()
 {
+	// 换图时不清空已连接玩家的 gB_GLOpen（Cookie 不会在换图时重新触发，
+	// 清空会导致换图后所有玩家 !gl 状态丢失）。
+	// 只清空 wantRoute 标记（路线已失效，允许重新触发加载）。
 	for (int client = 1; client <= MaxClients; client++)
 	{
-		gB_GLOpen[client] = false;
 		gB_GLWantRoute[client] = false;
 		gF_GLWantRouteTime[client] = 0.0;
 	}

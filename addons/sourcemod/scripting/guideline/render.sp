@@ -16,6 +16,12 @@
 	  小于 beam_lifetime 4.0s 避免闪烁）。只发送给开启 !gl 的玩家本人。
 */
 
+// =====[ STATE ]=====
+
+int gGL_RenderTick; // 渲染节流计数（大路线降频用）
+ArrayList gGL_Segments; // 预计算线段缓存（每项 6 个 float: start[3]+end[3]）
+int gGL_SegmentCursor[MAXPLAYERS + 1]; // 分批渲染游标（每玩家独立，滚动窗口起点）
+
 
 
 // =====[ PUBLIC ]=====
@@ -23,6 +29,7 @@
 void GL_OnMapStart_Render()
 {
 	GL_OnMapStart_State();
+	GL_ClearSegmentCache();
 }
 
 // Cookie 缓存完成：恢复开关状态
@@ -34,6 +41,7 @@ void GL_OnClientCookiesCached(int client)
 void GL_OnClientDisconnect(int client)
 {
 	GL_OnClientDisconnect_State(client);
+	gGL_SegmentCursor[client] = 0;
 }
 
 // 定时器重建（refresh_interval 变化时）
@@ -45,15 +53,27 @@ void GL_RestartRenderTimer()
 		gH_RenderTimer = null;
 	}
 	float interval = GL_GetRefreshInterval();
-	if (interval < 0.5)
+	if (interval < 0.1)
 	{
-		interval = 0.5;
+		interval = 0.1;
 	}
 	gH_RenderTimer = CreateTimer(interval, GL_Timer_Render, _, TIMER_REPEAT);
 }
 
+// 热加载兜底：OnMapStart 未触发时确保光束模型已预缓存
+void GL_EnsureBeamModelLoaded()
+{
+	if (gI_BeamModel == 0)
+	{
+		gI_BeamModel = PrecacheModel("materials/sprites/laserbeam.vmt", true);
+		GL_LogDebug("Beam model precached on-demand (hot reload)");
+	}
+}
+
 public Action GL_Timer_Render(Handle timer)
 {
+	gGL_RenderTick++;
+
 	for (int client = 1; client <= MaxClients; client++)
 	{
 		if (!GL_IsValidClient(client) || !gB_GLOpen[client])
@@ -82,39 +102,49 @@ public Action GL_Timer_Render(Handle timer)
 			gB_GLWantRoute[client] = false;
 		}
 
+		// 渲染前确保光束模型已预缓存（热加载兜底）
+		GL_EnsureBeamModelLoaded();
+
 		GL_RenderRouteToClient(client);
 	}
 	return Plugin_Continue;
 }
 
-// 渲染路线给单个玩家（只发给本人）
-void GL_RenderRouteToClient(int client)
+// 清空线段缓存（换图/重载时）
+void GL_ClearSegmentCache()
 {
-	if (!GL_HasRoute())
+	if (gGL_Segments != null)
+	{
+		delete gGL_Segments;
+	}
+	gGL_Segments = null;
+	for (int client = 1; client <= MaxClients; client++)
+	{
+		gGL_SegmentCursor[client] = 0;
+	}
+}
+
+// 预构建线段缓存：解析完成后调用（routes.sp 的 GL_RouteFinishParsed）
+// 全量 Cheikin 细分后的线段存下来，后续渲染只做轮转发送，
+// 避免每次渲染重复计算 + 一次性发送过多 beam 被丢弃
+void GL_BuildSegmentCache(ArrayList points)
+{
+	GL_ClearSegmentCache();
+	if (points == null || points.Length < 2)
 	{
 		return;
 	}
-
-	ArrayList points = gGL_Route.points;
 	int n = points.Length;
-	if (n < 2)
-	{
-		return;
-	}
-
-	int maxSegments = GL_GetMaxSegments();
 	float breakDist = GL_GetBreakDist();
 	float verticalBreakDist = GL_GetVerticalBreakDist();
-
-	int color[4];
-	GL_GetColor(color);
-	float life = GL_GetBeamLifetime();
-	float width = GL_GetBeamWidth();
 
 	// Chaikin 细分迭代次数（性能自适应：超限自动降级，仍保持全图）
 	int chaikinIter = GL_GetSmooth() ? GL_GetSmoothPoints() : 0;
 	if (chaikinIter < 0) chaikinIter = 0;
 	if (chaikinIter > 3) chaikinIter = 3;
+
+	// maxSegments 保护：超出时降低细分（保持全图但线条略直）
+	int maxSegments = GL_GetMaxSegments();
 	int subdiv = 1 << chaikinIter;
 	int totalBeams = (n - 1) * subdiv;
 	while (chaikinIter > 0 && totalBeams > maxSegments)
@@ -123,14 +153,10 @@ void GL_RenderRouteToClient(int client)
 		subdiv = 1 << chaikinIter;
 		totalBeams = (n - 1) * subdiv;
 	}
-	// 硬保护：超过 4000 条 beam 强制再降（极长图）
-	if (totalBeams > 4000)
-	{
-		chaikinIter = 0;
-		subdiv = 1;
-	}
 
-	// 收集连续点序列（断点处断开），保证起点与终点必定可见
+	gGL_Segments = new ArrayList(6); // 每项 6 float: start[3] + end[3]
+
+	// 收集连续点序列（断点处断开），逐段细分后存入缓存
 	ArrayList seq = new ArrayList(3);
 
 	for (int ptIdx = 0; ptIdx < n; ptIdx++)
@@ -142,12 +168,10 @@ void GL_RenderRouteToClient(int client)
 			points.GetArray(ptIdx - 1, prev);
 			points.GetArray(ptIdx, cur);
 
-			// 优先使用降采样时确定的断点标记（双层/传送/距离断点）
 			if (cur.isBreak)
 			{
 				needFlushBefore = true;
 			}
-			// 兜底：3D 距离断点（渲染时点序变化导致标记失效的情况）
 			else
 			{
 				float dist = GL_Distance3D(prev.origin, cur.origin);
@@ -155,7 +179,6 @@ void GL_RenderRouteToClient(int client)
 				{
 					needFlushBefore = true;
 				}
-				// 双层场景：水平距离近但垂直距离突变也断开
 				else
 				{
 					float vertDelta = FloatAbs(cur.origin[2] - prev.origin[2]);
@@ -170,10 +193,7 @@ void GL_RenderRouteToClient(int client)
 
 		if (needFlushBefore)
 		{
-			if (seq.Length >= 2)
-			{
-				FlushChaikinRoute(client, seq, chaikinIter, color, life, width);
-			}
+			BuildSegmentsFromSequence(seq, chaikinIter);
 			delete seq;
 			seq = new ArrayList(3);
 		}
@@ -182,16 +202,15 @@ void GL_RenderRouteToClient(int client)
 		points.GetArray(ptIdx, tp);
 		seq.PushArray(tp.origin);
 	}
-	// 收尾：最后一段序列必定绘制（含终点）
-	if (seq.Length >= 2)
-	{
-		FlushChaikinRoute(client, seq, chaikinIter, color, life, width);
-	}
+	// 收尾
+	BuildSegmentsFromSequence(seq, chaikinIter);
 	delete seq;
+
+	GL_LogDebug("Segment cache built: %d segments", gGL_Segments.Length);
 }
 
-// 对连续点序列做 Chaikin 角切割细分并绘制
-static void FlushChaikinRoute(int viewer, ArrayList seq, int iter, const int color[4], float life, float width)
+// 对点序列做 Chaikin 细分并把所有线段写入缓存
+static void BuildSegmentsFromSequence(ArrayList seq, int iter)
 {
 	if (seq.Length < 2)
 	{
@@ -233,18 +252,65 @@ static void FlushChaikinRoute(int viewer, ArrayList seq, int iter, const int col
 		cur = next;
 	}
 
+	// 写入缓存（6 float / 项）
 	for (int j = 0; j < cur.Length - 1; j++)
 	{
 		float a[3], b[3];
 		cur.GetArray(j, a);
 		cur.GetArray(j + 1, b);
-		DrawBeam(viewer, a, b, life, width, color);
+		gGL_Segments.PushArray(a);
+		gGL_Segments.PushArray(b);
 	}
 
 	delete cur;
 }
 
-// Team 激光束发送（参数与 GOKZ JumpBeam 完全一致：FadeLength 10、Amplitude 0、Speed 0）
+// 分批渲染：每个渲染 tick 只发送一批线段，轮转游标
+// 这样任意时刻客户端在途 beam ≤ 一批数量，不会因一次性发送过多被丢弃
+void GL_RenderRouteToClient(int client)
+{
+	if (!GL_HasRoute() || gGL_Segments == null || gGL_Segments.Length < 2)
+	{
+		return;
+	}
+
+	int totalSegments = gGL_Segments.Length / 2; // 每项 2 个 float[3]
+	int color[4];
+	GL_GetColor(color);
+	float life = GL_GetBeamLifetime();
+	float width = GL_GetBeamWidth();
+
+	// 每批最多发送段数（客户端单帧可稳定接收）
+	int batchSize = GL_GetBatchSize();
+	if (batchSize < 8) batchSize = 8;
+	if (batchSize > 120) batchSize = 120;
+
+	// 本 tick 只发送一批（轮转）
+	int cursor = gGL_SegmentCursor[client];
+	int end = cursor + batchSize;
+	if (end > totalSegments)
+	{
+		end = totalSegments;
+	}
+
+	float seg[6];
+	for (int s = cursor; s < end; s++)
+	{
+		gGL_Segments.GetArray(s * 2, seg); // 6 cells = 2 float[3]
+		float a[3];
+		a[0] = seg[0]; a[1] = seg[1]; a[2] = seg[2];
+		float b[3];
+		b[0] = seg[3]; b[1] = seg[4]; b[2] = seg[5];
+		DrawBeam(client, a, b, life, width, color);
+	}
+
+	// 推进游标（完成后回绕）
+	gGL_SegmentCursor[client] = (end == totalSegments) ? 0 : end;
+
+	GL_LogDebug("Render batch: %d-%d / %d (tick %d)", cursor, end, totalSegments, gGL_RenderTick);
+}
+
+// 激光束发送（参数与 GOKZ JumpBeam 完全一致：FadeLength 10、Amplitude 0、Speed 0）
 static void DrawBeam(int viewer, const float a[3], const float b[3], float life, float width, const int color[4])
 {
 	float start[3], end[3];

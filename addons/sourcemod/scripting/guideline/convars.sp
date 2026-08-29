@@ -26,6 +26,7 @@ ConVar gCV_MaxSegments;
 ConVar gCV_ParseBatch;
 ConVar gCV_MetaTimeout;
 ConVar gCV_DownloadTimeout;
+ConVar gCV_BatchSize;
 
 
 
@@ -59,8 +60,8 @@ void GL_CreateConVars()
 		"线条存活时间（秒），与 GOKZ JumpBeam 一致。" , _, true, 0.5, true, 10.0);
 	gCV_BeamWidth = AutoExecConfig_CreateConVar("gokz_guideline_beam_width", "0.25",
 		"线条宽度（与 GOKZ JumpBeam 一致）。", _, true, 0.1, true, 8.0);
-	gCV_RefreshInterval = AutoExecConfig_CreateConVar("gokz_guideline_refresh_interval", "2.0",
-		"路线重发光束的刷新间隔（秒），需小于 beam_lifetime 避免闪烁。", _, true, 0.5, true, 5.0);
+	gCV_RefreshInterval = AutoExecConfig_CreateConVar("gokz_guideline_refresh_interval", "0.3",
+		"路线发光束的刷新间隔（秒）——分批滚动发送，每周期发一批线段；\n		需保证 路线段数/批大宽 × 间隔 < beam_lifetime 才能整条覆盖。", _, true, 0.1, true, 5.0);
 	gCV_Smooth = AutoExecConfig_CreateConVar("gokz_guideline_smooth", "1",
 		"路线平滑开关：Chaikin 角切割细分，拐角处切出圆角（与 JumpBeam 视觉一致）。", _, true, 0.0, true, 1.0);
 	gCV_SmoothPoints = AutoExecConfig_CreateConVar("gokz_guideline_smooth_points", "1",
@@ -79,6 +80,8 @@ void GL_CreateConVars()
 		"R2 meta 查询超时（秒）。", _, true, 3.0, true, 60.0);
 	gCV_DownloadTimeout = AutoExecConfig_CreateConVar("gokz_guideline_download_timeout", "30",
 		"R2 录像下载超时（秒）。", _, true, 5.0, true, 120.0);
+	gCV_BatchSize = AutoExecConfig_CreateConVar("gokz_guideline_batch_size", "160",
+		"每渲染周期发送的最大线段数（分批滚动发送，防止一次性发送过多被客户端丢弃；\n		建议 段数/批数×刷新间隔 < beam_lifetime 保证连续显示）。", _, true, 8.0, true, 256.0);
 
 	AutoExecConfig_ExecuteFile();
 	AutoExecConfig_CleanFile();
@@ -173,6 +176,11 @@ int GL_GetMetaTimeout()
 int GL_GetDownloadTimeout()
 {
 	return gCV_DownloadTimeout.IntValue;
+}
+
+int GL_GetBatchSize()
+{
+	return gCV_BatchSize.IntValue;
 }
 
 void GL_GetColor(int color[4])

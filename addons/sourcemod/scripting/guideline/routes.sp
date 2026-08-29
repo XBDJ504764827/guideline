@@ -77,6 +77,9 @@ void GL_ClearCurrentRoute()
 	gGL_Route.tickrate = 128;
 	gGL_Route.source = GL_SOURCE_NONE;
 	gGL_Route.playerName[0] = '\0';
+
+	// 同步清空渲染线段缓存（避免旧路线线条残留）
+	GL_ClearSegmentCache();
 }
 
 // 是否已有一条可用的路线
@@ -128,6 +131,9 @@ void GL_RouteFinishParsed(const char[] playerName, float time, int teleports, in
 	gGL_Route.parsing = false;
 	gGL_Route.downloading = false;
 	gGL_Route.source = gGL_PendingSource;
+
+	// 构建渲染线段缓存（分批发送用）
+	GL_BuildSegmentCache(points);
 
 	GL_LogDebug("Route parsed: player=\"%s\" time=%.2f teleports=%d points=%d tickrate=%d source=%d",
 		playerName, time, teleports, points.Length, tickrate, gGL_Route.source);
