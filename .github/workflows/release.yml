@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout main (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check skip ci (version bump commit)
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          MSG="$(git log -1 --pretty=%B || true)"
+          echo "Last commit message: $MSG"
+          if echo "$MSG" | grep -q "\[skip ci\]"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "This is a version bump commit, will skip release to avoid loop."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine next version (auto bump patch)
+        if: steps.check.outputs.skip == 'false'
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CUR="$(grep -E '#define GL_VERSION' addons/sourcemod/scripting/include/guideline/version.inc | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ -z "$CUR" ]; then echo "Failed to parse GL_VERSION"; exit 1; fi
+          echo "File version: $CUR"
+          git fetch --tags --force 2>&1 | head -n 20 || true
+          LATEST="$(git tag --list 'v*' | sort -V | tail -n1 || true)"
+          if [ -z "$LATEST" ]; then LATEST="v0.0.0"; fi
+          LATEST_VER="${LATEST#v}"
+          echo "Latest tag: $LATEST ($LATEST_VER)"
+          BASE="$(printf "%s\n%s\n" "$CUR" "$LATEST_VER" | sort -V | tail -n1)"
+          echo "Base: $BASE"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
+          MAJOR="${MAJOR:-0}"; MINOR="${MINOR:-0}"; PATCH="${PATCH:-0}"
+          MAJOR="$(echo "$MAJOR" | grep -oE '[0-9]+' | head -n1 || echo 0)"
+          MINOR="$(echo "$MINOR" | grep -oE '[0-9]+' | head -n1 || echo 0)"
+          PATCH="$(echo "$PATCH" | grep -oE '[0-9]+' | head -n1 || echo 0)"
+          NEXT_PATCH=$((PATCH + 1))
+          NEXT="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+          TAG="v${NEXT}"
+          echo "Next: $NEXT ($TAG)"
+          while git rev-parse "$TAG" >/dev/null 2>&1; do
+            echo "Tag $TAG already exists, incrementing patch"
+            IFS='.' read -r MAJ MIN PAT <<< "${TAG#v}"
+            PAT=$((PAT + 1))
+            TAG="v${MAJ}.${MIN}.${PAT}"
+            NEXT="${TAG#v}"
+            echo "Trying $TAG"
+          done
+          echo "Resolved: $NEXT ($TAG)"
+          echo "cur=$CUR" >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version in source
+        if: steps.check.outputs.skip == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NEXT="${{ steps.version.outputs.next }}"
+          echo "Bumping GL_VERSION to $NEXT"
+          sed -i -E "s/#define GL_VERSION \"[^\"]+\"/#define GL_VERSION \"$NEXT\"/" addons/sourcemod/scripting/include/guideline/version.inc
+          sed -i -E "s/#define GL_VERSION_PATCH [0-9]+/#define GL_VERSION_PATCH $(echo $NEXT | cut -d. -f3)/" addons/sourcemod/scripting/include/guideline/version.inc
+          sed -i -E "s/#define GL_VERSION_MINOR [0-9]+/#define GL_VERSION_MINOR $(echo $NEXT | cut -d. -f2)/" addons/sourcemod/scripting/include/guideline/version.inc
+          sed -i -E "s/#define GL_VERSION_MAJOR [0-9]+/#define GL_VERSION_MAJOR $(echo $NEXT | cut -d. -f1)/" addons/sourcemod/scripting/include/guideline/version.inc
+          grep -n "GL_VERSION" addons/sourcemod/scripting/include/guideline/version.inc
+          if ! git diff --quiet -- addons/sourcemod/scripting/include/guideline/version.inc; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add addons/sourcemod/scripting/include/guideline/version.inc
+            git commit -m "chore: bump version to v$NEXT [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+            echo "Version bump pushed"
+          else
+            echo "No diff, skip push"
+          fi
+
+      - name: Setup SourceMod + GOKZ includes
+        if: steps.check.outputs.skip == 'false'
+        run: ./build.sh setup
+
+      - name: Strict compile
+        if: steps.check.outputs.skip == 'false'
+        run: STRICT=1 ./build.sh
+        env:
+          STRICT: "1"
+
+      - name: Verify single SMX
+        if: steps.check.outputs.skip == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh addons/sourcemod/plugins/guideline.smx
+          count="$(ls addons/sourcemod/plugins/*.smx 2>/dev/null | wc -l)"
+          if [ "$count" != "1" ]; then
+            echo "Expected exactly 1 smx, got $count"
+            ls -la addons/sourcemod/plugins/
+            exit 1
+          fi
+
+      - name: Package Release
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.next }}"
+          ZIP="guideline-v${VER}.zip"
+          PKG="release-package"
+          rm -rf "$PKG" "$ZIP"
+          mkdir -p "$PKG/addons/sourcemod/plugins"
+          cp addons/sourcemod/plugins/guideline.smx "$PKG/addons/sourcemod/plugins/"
+          cp README.md "$PKG/"
+          (cd "$PKG" && zip -r "../$ZIP" .)
+          ls -lh "$ZIP"
+          unzip -l "$ZIP"
+          echo "ZIP=$ZIP" >> $GITHUB_ENV
+
+      - name: Create and push tag
+        if: steps.check.outputs.skip == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          git fetch --tags --force 2>&1 | head -n 5 || true
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists locally, skipping create"
+          else
+            git tag "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+            echo "Tag $TAG pushed"
+          fi
+          git tag --list | sort -V | tail -n 10
+
+      - name: Create GitHub Release (publish)
+        if: steps.check.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: ${{ env.ZIP }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release artifact (backup)
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: guideline-${{ steps.version.outputs.tag }}
+          path: |
+            ${{ env.ZIP }}
+          retention-days: 90

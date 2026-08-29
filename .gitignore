@@ -1,0 +1,39 @@
+# ===== 构建产物 =====
+*.smx
+*.smx.bak
+*.asm
+.sm111/
+.deps/
+dist/
+package/
+release-package/
+
+# ===== 服务器运行时数据（不提交） =====
+addons/sourcemod/data/
+addons/sourcemod/logs/
+addons/sourcemod/configs/
+addons/sourcemod/plugins/disabled/
+# 运行时生成的 gokz 配置不提交，但保留 guideline 默认模板
+cfg/sourcemod/gokz/*.cfg
+!cfg/sourcemod/gokz/gokz-guideline.cfg
+
+# ===== Python 工具 =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ===== 测试生成物 =====
+test_replay/
+
+# ===== 编辑器 / 系统文件 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.zip
+
+# ===== 日志 =====
+*.log
