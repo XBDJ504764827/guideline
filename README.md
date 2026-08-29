@@ -12,6 +12,7 @@ CS:GO GOKZ 路线指引插件：从**插件缓存 / 服务器本地 GOKZ 录像 
 - 💜 **JumpBeam 同款线条**：`laserbeam.vmt`、宽度 0.25、FadeLength 10、Amplitude 0、速度 0，默认紫色（148 0 211 110）；Chaikin 角切割平滑，拐角自然圆弧
 - 🔇 **传送点断开**：录像 flags bit 22（teleport）处不连线，避免线条穿地图（已确认：坐标实际走过、捷径/绕路如实显示、传送跳过）
 - 🚀 **`!gl` 开关**：每个玩家独立，Cookie 持久化，只显示给本人；与计时状态无关，开启后常驻显示
+- ♿ **多模式支持**：KZT/SKZ/VNL 三种模式的路线独立加载（`wr/{mode}/{map}/...`），玩家切换 GOKZ 模式时自动显示对应模式路线
 - 🔄 **自动检查**：换图时自动检查一次 + 本服破纪录自动重查 + `!routerefresh` 手动强制刷新（管理员）
 - 🧱 模块化代码结构（单入口 .sp + 模块目录，最终只编译一个 guideline.smx）
 - ⚙️ CI 自动化：PR 编译检查 + 测试包 artifact；合并 main 自动 bump 版本号并发布 Release

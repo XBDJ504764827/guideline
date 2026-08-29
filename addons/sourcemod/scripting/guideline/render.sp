@@ -21,6 +21,12 @@
 int gGL_RenderTick; // 渲染节流计数（大路线降频用）
 ArrayList gGL_Segments; // 预计算线段缓存（每项 6 个 float: start[3]+end[3]）
 int gGL_SegmentCursor[MAXPLAYERS + 1]; // 分批渲染游标（每玩家独立，滚动窗口起点）
+int gGL_CacheMode; // 线段缓存所属的模式（0=VNL 1=SKZ 2=KZT）
+// 玩家附近段缓存（性能优化：玩家不动时不重扫）
+float gGL_PlayerLastOrigin[MAXPLAYERS + 1][3];
+bool gGL_PlayerNearValid[MAXPLAYERS + 1];
+int gGL_PlayerNearCount[MAXPLAYERS + 1];
+int gGL_PlayerNearSegs[MAXPLAYERS + 1][256]; // 最大缓存 256 个附近段索引
 
 
 
@@ -30,6 +36,13 @@ void GL_OnMapStart_Render()
 {
 	GL_OnMapStart_State();
 	GL_ClearSegmentCache();
+
+	// 重置附近段缓存
+	for (int client = 1; client <= MaxClients; client++)
+	{
+		gGL_PlayerNearValid[client] = false;
+		gGL_PlayerNearCount[client] = 0;
+	}
 }
 
 // Cookie 缓存完成：恢复开关状态
@@ -42,6 +55,8 @@ void GL_OnClientDisconnect(int client)
 {
 	GL_OnClientDisconnect_State(client);
 	gGL_SegmentCursor[client] = 0;
+	gGL_PlayerNearValid[client] = false;
+	gGL_PlayerNearCount[client] = 0;
 }
 
 // 定时器重建（refresh_interval 变化时）
@@ -80,9 +95,9 @@ public Action GL_Timer_Render(Handle timer)
 			continue;
 		}
 
-		if (!GL_HasRoute())
+		if (!GL_HasRoute(GOKZ_GetCoreOption(client, Option_Mode)))
 		{
-			// 已开启但路线未就绪：按需触发一次加载；失败后 60 秒允许重试
+			// 已开启但该模式路线未就绪：按需触发一次加载；失败后 60 秒允许重试
 			if (!gB_GLWantRoute[client])
 			{
 				gB_GLWantRoute[client] = true;
@@ -271,7 +286,30 @@ static void BuildSegmentsFromSequence(ArrayList seq, int iter)
 // 附近优先解决"玩家附近不显示"；轮转解决"时有时无"（完整覆盖）
 void GL_RenderRouteToClient(int client)
 {
-	if (!GL_HasRoute() || gGL_Segments == null || gGL_Segments.Length < 2)
+	if (!GL_HasRoute())
+	{
+		return;
+	}
+
+	// 按玩家当前模式获取路线；若线段缓存尚未为该模式构建则重建
+	int mode = GOKZ_GetCoreOption(client, Option_Mode);
+	if (!GL_HasRoute(mode))
+	{
+		return; // 该模式无路线（渲染由 EnsureRoute 触发加载）
+	}
+	if (gGL_Segments == null || gGL_Segments.Length < 2 || gGL_CacheMode != mode)
+	{
+		// 该模式已加载但缓存未构建（或模式不符）→ 重建
+		gGL_CacheMode = mode;
+		Route routeInfo;
+		GL_GetRoute(mode, routeInfo);
+		if (routeInfo.points != null)
+		{
+			GL_BuildSegmentCache(routeInfo.points);
+		}
+	}
+
+	if (gGL_Segments == null || gGL_Segments.Length < 2)
 	{
 		return;
 	}
@@ -308,50 +346,77 @@ void GL_RenderRouteToClient(int client)
 	// —— 第一步：玩家附近段（附近优先）——
 	if (playerAlive && nearQuota >= 4)
 	{
-		int maxNearScan = totalSegments < 4096 ? totalSegments : 4096; // 扫描上限，防卡
-		int[] nearIdx = new int[maxNearScan];
-		float[] nearDist = new float[maxNearScan];
-		int nearCount = 0;
-
-		float nearDistLimit = GL_GetNearDist();
-		for (int s = 0; s < maxNearScan; s++)
+		// 性能优化：玩家移动 < 100 units 时不重新扫描，复用上次结果
+		bool needRescan = true;
+		if (gGL_PlayerNearValid[client])
 		{
-			float seg[6];
-			gGL_Segments.GetArray(s, seg);
-			float mid[3];
-			mid[0] = (seg[0] + seg[3]) * 0.5;
-			mid[1] = (seg[1] + seg[4]) * 0.5;
-			mid[2] = (seg[2] + seg[5]) * 0.5;
-			float d = GL_Distance3D(mid, playerOrigin);
-			if (d < nearDistLimit)
+			float dx = playerOrigin[0] - gGL_PlayerLastOrigin[client][0];
+			float dy = playerOrigin[1] - gGL_PlayerLastOrigin[client][1];
+			float dz = playerOrigin[2] - gGL_PlayerLastOrigin[client][2];
+			float moved = SquareRoot(dx * dx + dy * dy + dz * dz);
+			if (moved < 100.0)
 			{
-				nearIdx[nearCount] = s;
-				nearDist[nearCount] = d;
-				nearCount++;
+				needRescan = false;
 			}
 		}
 
-		// 距离升序简单排序（近段数一般不多；插入排序够用）
-		for (int i = 1; i < nearCount; i++)
+		if (needRescan)
 		{
-			int sVal = nearIdx[i];
-			float dVal = nearDist[i];
-			int j = i - 1;
-			while (j >= 0 && nearDist[j] > dVal)
+			gGL_PlayerLastOrigin[client] = playerOrigin;
+
+			int maxNearScan = totalSegments < 4096 ? totalSegments : 4096; // 扫描上限，防卡
+			int[] nearIdx = new int[maxNearScan];
+			float[] nearDist = new float[maxNearScan];
+			int nearCount = 0;
+
+			float nearDistLimit = GL_GetNearDist();
+			for (int s = 0; s < maxNearScan; s++)
 			{
-				nearIdx[j + 1] = nearIdx[j];
-				nearDist[j + 1] = nearDist[j];
-				j--;
+				float seg[6];
+				gGL_Segments.GetArray(s, seg);
+				float mid[3];
+				mid[0] = (seg[0] + seg[3]) * 0.5;
+				mid[1] = (seg[1] + seg[4]) * 0.5;
+				mid[2] = (seg[2] + seg[5]) * 0.5;
+				float d = GL_Distance3D(mid, playerOrigin);
+				if (d < nearDistLimit)
+				{
+					nearIdx[nearCount] = s;
+					nearDist[nearCount] = d;
+					nearCount++;
+				}
 			}
-			nearIdx[j + 1] = sVal;
-			nearDist[j + 1] = dVal;
+
+			// 距离升序简单排序（近段数一般不多；插入排序够用）
+			for (int i = 1; i < nearCount; i++)
+			{
+				int sVal = nearIdx[i];
+				float dVal = nearDist[i];
+				int j = i - 1;
+				while (j >= 0 && nearDist[j] > dVal)
+				{
+					nearIdx[j + 1] = nearIdx[j];
+					nearDist[j + 1] = nearDist[j];
+					j--;
+				}
+				nearIdx[j + 1] = sVal;
+				nearDist[j + 1] = dVal;
+			}
+
+			// 缓存最近的 nearQuota 个（供下次复用）
+			gGL_PlayerNearCount[client] = nearCount < nearQuota ? nearCount : nearQuota;
+			for (int i = 0; i < gGL_PlayerNearCount[client]; i++)
+			{
+				gGL_PlayerNearSegs[client][i] = nearIdx[i];
+			}
+			gGL_PlayerNearValid[client] = true;
 		}
 
-		// 取最近的 nearQuota 个
-		int take = nearCount < nearQuota ? nearCount : nearQuota;
-		for (int i = 0; i < take; i++)
+		// 使用（可能缓存的）附近段列表
+		int take = gGL_PlayerNearCount[client];
+		for (int i = 0; i < take && sendCount < batchSize; i++)
 		{
-			sendOrder[sendCount++] = nearIdx[i];
+			sendOrder[sendCount++] = gGL_PlayerNearSegs[client][i];
 		}
 	}
 

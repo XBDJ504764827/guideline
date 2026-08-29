@@ -1,9 +1,10 @@
 /*
 	Guideline - Routes
-	路线数据管理：当前路线（Route 单例）、轨迹降采样、来源追踪、缓存路径。
+	路线数据管理：按 GOKZ 模式（KZT/SKZ/VNL）分别存储路线、轨迹降采样、来源追踪、缓存路径。
 	解析与下载分别由 replayfile.sp / http.sp 负责。
 
 	当前版本只支持主图 course 0（B1/B2 不需要）。
+	模式 0=Vanilla(VNL)、1=SimpleKZ(SKZ)、2=KZTimer(KZT)（与 GOKZ_GetCoreOption 一致）。
 */
 
 
@@ -30,6 +31,7 @@ enum
 
 enum struct Route
 {
+	int mode;         // GOKZ 模式（0=VNL 1=SKZ 2=KZT）
 	float time;       // 录像成绩（秒）
 	int teleports;    // 主图 NUB/PRO
 	int tickrate;     // 录像 tickrate
@@ -45,8 +47,11 @@ enum struct Route
 
 // =====[ STATE ]=====
 
-Route gGL_Route; // 当前地图主图路线（单例，course 0）
+// 按模式存储路线（0=VNL, 1=SKZ, 2=KZT），每条路线的 ArrayList 由 Route 结构持有
+Route gGL_Routes[3];
 int gGL_PendingSource; // 解析完成时的来源标记（http.sp 设置，replayfile 完成时读取）
+int gGL_PendingMode;   // 解析完成时的目标模式（http.sp 设置）
+int gGL_BuildMode;     // 当前正在构建/渲染的模式（默认 GOKZ 默认模式）
 
 
 
@@ -54,89 +59,160 @@ int gGL_PendingSource; // 解析完成时的来源标记（http.sp 设置，repl
 
 void GL_OnMapStart_Routes()
 {
-	GL_ClearCurrentRoute();
+	GL_ClearAllRoutes();
 }
 
 void GL_OnMapEnd_Routes()
 {
-	GL_ClearCurrentRoute();
+	GL_ClearAllRoutes();
 }
 
-void GL_ClearCurrentRoute()
+void GL_ClearAllRoutes()
 {
-	if (gGL_Route.points != null)
+	for (int mode = 0; mode < 3; mode++)
 	{
-		delete gGL_Route.points;
+		GL_ClearRoute(mode);
 	}
-	gGL_Route.points = null;
-	gGL_Route.loaded = false;
-	gGL_Route.parsing = false;
-	gGL_Route.downloading = false;
-	gGL_Route.time = 0.0;
-	gGL_Route.teleports = 0;
-	gGL_Route.tickrate = 128;
-	gGL_Route.source = GL_SOURCE_NONE;
-	gGL_Route.playerName[0] = '\0';
-
 	// 同步清空渲染线段缓存（避免旧路线线条残留）
 	GL_ClearSegmentCache();
 }
 
-// 是否已有一条可用的路线
-bool GL_HasRoute()
+void GL_ClearRoute(int mode)
 {
-	return gGL_Route.loaded && gGL_Route.points != null && gGL_Route.points.Length >= 2;
+	if (mode < 0 || mode > 2) return;
+
+	if (gGL_Routes[mode].points != null)
+	{
+		delete gGL_Routes[mode].points;
+	}
+	gGL_Routes[mode].points = null;
+	gGL_Routes[mode].loaded = false;
+	gGL_Routes[mode].parsing = false;
+	gGL_Routes[mode].downloading = false;
+	gGL_Routes[mode].time = 0.0;
+	gGL_Routes[mode].teleports = 0;
+	gGL_Routes[mode].tickrate = 128;
+	gGL_Routes[mode].source = GL_SOURCE_NONE;
+	gGL_Routes[mode].playerName[0] = '\0';
 }
 
-// 当前路线成绩（供三方对比）
-bool GL_GetCurrentRouteTime(float &time)
+// 获取指定模式的路线（不存在则返回 false）
+bool GL_GetRoute(int mode, Route route)
 {
-	if (!gGL_Route.loaded || gGL_Route.time <= 0.0)
+	if (mode < 0 || mode > 2)
 	{
 		return false;
 	}
-	time = gGL_Route.time;
+	route = gGL_Routes[mode];
 	return true;
 }
 
-// 设置解析完成时的来源标记（http.sp 在调用 GL_StartParsing 前设置）
+// 获取指定模式路线是否可用
+bool GL_HasRoute(int mode = -1)
+{
+	if (mode < 0)
+	{
+		mode = gGL_BuildMode;
+	}
+	if (mode < 0 || mode > 2)
+	{
+		return false;
+	}
+	return gGL_Routes[mode].loaded && gGL_Routes[mode].points != null
+		&& gGL_Routes[mode].points.Length >= 2;
+}
+
+// 当前路线成绩（供三方对比）：返回指定模式的时间
+bool GL_GetCurrentRouteTime(float &time, int mode = -1)
+{
+	if (mode < 0)
+	{
+		mode = gGL_BuildMode;
+	}
+	if (mode < 0 || mode > 2)
+	{
+		return false;
+	}
+	if (!gGL_Routes[mode].loaded || gGL_Routes[mode].time <= 0.0)
+	{
+		return false;
+	}
+	time = gGL_Routes[mode].time;
+	return true;
+}
+
+// 设置解析完成时的来源/模式标记（http.sp 在调用 GL_StartParsing 前设置）
 void GL_SetPendingSource(int source)
 {
 	gGL_PendingSource = source;
 }
 
-// 构建 R2 下载缓存路径：data/gokz-guideline/<map>_pro.replay
-void GL_BuildCachePath(char[] buffer, int maxlength)
+void GL_SetPendingMode(int mode)
 {
-	BuildPath(Path_SM, buffer, maxlength, "data/gokz-guideline/%s_pro.replay", gC_MapName);
+	gGL_PendingMode = mode;
+}
+
+// 构建 R2/本地缓存路径：data/gokz-guideline/<map>_<mode>_pro.replay
+void GL_BuildCachePath(char[] buffer, int maxlength, int mode = -1)
+{
+	if (mode < 0) mode = gGL_BuildMode;
+	char modeStr[8];
+	GL_GetModeShortName(mode, modeStr, sizeof(modeStr));
+	BuildPath(Path_SM, buffer, maxlength, "data/gokz-guideline/%s_%s_pro.replay", gC_MapName, modeStr);
 }
 
 // 构建 sha256 缓存文件路径（meta 新鲜度比对用）
-void GL_BuildCacheShaPath(char[] buffer, int maxlength)
+void GL_BuildCacheShaPath(char[] buffer, int maxlength, int mode = -1)
 {
-	BuildPath(Path_SM, buffer, maxlength, "data/gokz-guideline/%s_pro.sha256", gC_MapName);
+	if (mode < 0) mode = gGL_BuildMode;
+	char modeStr[8];
+	GL_GetModeShortName(mode, modeStr, sizeof(modeStr));
+	BuildPath(Path_SM, buffer, maxlength, "data/gokz-guideline/%s_%s_pro.sha256", gC_MapName, modeStr);
+}
+
+// 模式短名（与 stratosphere 键名一致：vnl/skz/kzt）
+void GL_GetModeShortName(int mode, char[] buffer, int maxlength)
+{
+	switch (mode)
+	{
+		case 0: strcopy(buffer, maxlength, "vnl");
+		case 1: strcopy(buffer, maxlength, "skz");
+		default: strcopy(buffer, maxlength, "kzt");
+	}
 }
 
 // 解析完成回调（replayfile.sp 调用）
 void GL_RouteFinishParsed(const char[] playerName, float time, int teleports, int tickrate, ArrayList points)
 {
-	GL_ClearCurrentRoute();
+	int mode = gGL_PendingMode;
+	if (mode < 0 || mode > 2)
+	{
+		mode = gGL_BuildMode;
+	}
 
-	gGL_Route.time = time;
-	strcopy(gGL_Route.playerName, sizeof(gGL_Route.playerName), playerName);
-	gGL_Route.teleports = teleports;
-	gGL_Route.tickrate = tickrate < 1 ? 128 : tickrate;
-	gGL_Route.points = points;
-	gGL_Route.loaded = true;
-	gGL_Route.parsing = false;
-	gGL_Route.downloading = false;
-	gGL_Route.source = gGL_PendingSource;
+	GL_ClearRoute(mode);
 
-	// 构建渲染线段缓存（分批发送用）
-	GL_BuildSegmentCache(points);
+	gGL_Routes[mode].mode = mode;
+	gGL_Routes[mode].time = time;
+	strcopy(gGL_Routes[mode].playerName, sizeof(Route::playerName), playerName);
+	gGL_Routes[mode].teleports = teleports;
+	gGL_Routes[mode].tickrate = tickrate < 1 ? 128 : tickrate;
+	gGL_Routes[mode].points = points;
+	gGL_Routes[mode].loaded = true;
+	gGL_Routes[mode].parsing = false;
+	gGL_Routes[mode].downloading = false;
+	gGL_Routes[mode].source = gGL_PendingSource;
 
-	GL_LogDebug("Route parsed: player=\"%s\" time=%.2f teleports=%d points=%d tickrate=%d source=%d",
-		playerName, time, teleports, points.Length, tickrate, gGL_Route.source);
+	// 若该模式是当前构建模式，构建渲染线段缓存
+	if (mode == gGL_BuildMode)
+	{
+		GL_BuildSegmentCache(points);
+	}
+
+	// 来源名（日志用）
+	static const char GL_SourceNames[4][8] = { "none", "cache", "local", "remote" };
+	GL_LogDebug("Route parsed: mode=%d player=\"%s\" time=%.2f teleports=%d points=%d tickrate=%d source=%s",
+		mode, playerName, time, teleports, points.Length, tickrate, GL_SourceNames[gGL_PendingSource]);
 }
 
 
