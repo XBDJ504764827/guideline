@@ -293,6 +293,40 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 	GL_LogDebug("Comparison: local=%.2f cache=%.2f remote=%.2f -> best source=%d",
 		localTime, cacheTime, remoteTime, bestSource);
 
+	// 情况 A：远程存在但无时间信息（time_ms=null）→ 无条件下载（下载后从录像
+	// header 解析真实时间，与本地/缓存再比较）。
+	// 只有一个例外：sha256 与缓存一致时可跳过下载直接用缓存（缓存即远程映像）。
+	if (remoteTimeMs <= 0 && remoteSha[0] != '\0')
+	{
+		char shaPath[PLATFORM_MAX_PATH];
+		GL_BuildCacheShaPath(shaPath, sizeof(shaPath));
+		char cachedSha[GL_SHA256_LENGTH];
+		ReadShaFile(shaPath, cachedSha, sizeof(cachedSha));
+
+		char cachePath3[PLATFORM_MAX_PATH];
+		GL_BuildCachePath(cachePath3, sizeof(cachePath3));
+		if (StrEqual(remoteSha, cachedSha, false) && FileExists(cachePath3))
+		{
+			gGL_MetaBusy = false;
+			GL_LogDebug("Remote has no time_ms but sha matches cache; using cache");
+			GL_SetPendingSource(GL_SOURCE_CACHE);
+			GL_StartParsing(cachePath3, 0, mode, requesterUserID);
+			return;
+		}
+
+		// 无缓存或 sha 不一致 → 下载
+		char url[GL_MAX_URL_LENGTH];
+		if (!GL_BuildURL(url, sizeof(url), mode, typeIdx))
+		{
+			gGL_MetaBusy = false;
+			FinishWithLocalOrCache(requesterUserID);
+			return;
+		}
+		GL_LogDebug("Remote exists but no time info; downloading to inspect");
+		StartDownload(mode, requesterUserID, url);
+		return;
+	}
+
 	if (bestSource == GL_SOURCE_REMOTE)
 	{
 		// R2 最快：sha 与缓存一致 → 直接解析缓存；不一致 → 下载 body
@@ -658,7 +692,8 @@ static void ExtractJsonStringValue(const char[] json, const char[] key, char[] o
 	out[len] = '\0';
 }
 
-// 从 meta JSON 中提取整数值：{"time_ms":12345, ...}
+// 从 meta JSON 中提取整数值：兼容 {"time_ms":12345} 和 {"time_ms":"12345"}
+// 值为 null 或不存在时返回 0
 static int ExtractJsonIntValue(const char[] json, const char[] key)
 {
 	char pattern[64];
@@ -670,8 +705,26 @@ static int ExtractJsonIntValue(const char[] json, const char[] key)
 	}
 	pos += strlen(pattern);
 
+	// 跳过空白
+	while (json[pos] == ' ' || json[pos] == '\t')
+	{
+		pos++;
+	}
+
+	// null → 0（严格匹配：null 后跟逗号或右花括号）
+	if (json[pos] == 'n' && json[pos + 1] == 'u' && json[pos + 2] == 'l' && json[pos + 3] == 'l')
+	{
+		return 0;
+	}
+
+	// 跳过可选的开头引号（字符串数字）
+	if (json[pos] == '"')
+	{
+		pos++;
+	}
+
 	int start = pos;
-	while (json[pos] != '\0' && json[pos] != ',' && json[pos] != '}')
+	while (json[pos] != '\0' && json[pos] != ',' && json[pos] != '}' && json[pos] != '"')
 	{
 		pos++;
 	}
