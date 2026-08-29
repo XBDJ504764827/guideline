@@ -252,14 +252,16 @@ static void BuildSegmentsFromSequence(ArrayList seq, int iter)
 		cur = next;
 	}
 
-	// 写入缓存（6 float / 项）
+	// 写入缓存（每项 6 float: start[3]+end[3]，与 ArrayList(6) 块匹配）
 	for (int j = 0; j < cur.Length - 1; j++)
 	{
 		float a[3], b[3];
 		cur.GetArray(j, a);
 		cur.GetArray(j + 1, b);
-		gGL_Segments.PushArray(a);
-		gGL_Segments.PushArray(b);
+		float seg[6];
+		seg[0] = a[0]; seg[1] = a[1]; seg[2] = a[2];
+		seg[3] = b[0]; seg[4] = b[1]; seg[5] = b[2];
+		gGL_Segments.PushArray(seg);
 	}
 
 	delete cur;
@@ -274,7 +276,7 @@ void GL_RenderRouteToClient(int client)
 		return;
 	}
 
-	int totalSegments = gGL_Segments.Length / 2; // 每项 2 个 float[3]
+	int totalSegments = gGL_Segments.Length; // 每项 6 cells = 1 段
 	int color[4];
 	GL_GetColor(color);
 	float life = GL_GetBeamLifetime();
@@ -283,7 +285,7 @@ void GL_RenderRouteToClient(int client)
 	// 每批最多发送段数（客户端单帧可稳定接收）
 	int batchSize = GL_GetBatchSize();
 	if (batchSize < 8) batchSize = 8;
-	if (batchSize > 120) batchSize = 120;
+	if (batchSize > 256) batchSize = 256;
 
 	// 本 tick 只发送一批（轮转）
 	int cursor = gGL_SegmentCursor[client];
@@ -294,9 +296,10 @@ void GL_RenderRouteToClient(int client)
 	}
 
 	float seg[6];
+	// 每项 6 cells，段 s 的起点是 s * 6（GetArray 按项索引读，自动乘以块大小）
 	for (int s = cursor; s < end; s++)
 	{
-		gGL_Segments.GetArray(s * 2, seg); // 6 cells = 2 float[3]
+		gGL_Segments.GetArray(s, seg);
 		float a[3];
 		a[0] = seg[0]; a[1] = seg[1]; a[2] = seg[2];
 		float b[3];
