@@ -52,11 +52,10 @@ void GL_RestartRenderTimer()
 		KillTimer(gH_RenderTimer);
 		gH_RenderTimer = null;
 	}
-	float interval = GL_GetRefreshInterval();
-	if (interval < 0.1)
-	{
-		interval = 0.1;
-	}
+	// 固定 0.15s 高刷新率：即使服务器 cfg 里 refresh_interval 残留旧值 (2.0)，
+	// 也能保证 段数/批量 × 0.15s < beam_lifetime，整条路线连续显示不闪烁。
+	// （cfg 的 gokz_guideline_refresh_interval 仅保留给高级调优，此处不读取）
+	float interval = 0.15;
 	gH_RenderTimer = CreateTimer(interval, GL_Timer_Render, _, TIMER_REPEAT);
 }
 
@@ -267,8 +266,9 @@ static void BuildSegmentsFromSequence(ArrayList seq, int iter)
 	delete cur;
 }
 
-// 分批渲染：每个渲染 tick 只发送一批线段，轮转游标
-// 这样任意时刻客户端在途 beam ≤ 一批数量，不会因一次性发送过多被丢弃
+// 分批渲染：每个渲染 tick 发送一批线段
+// 核心：每批【先发玩家附近段（快速闪现在玩家视野内）】+【轮转补剩余（保证全部段在 life 内被刷新）】
+// 附近优先解决"玩家附近不显示"；轮转解决"时有时无"（完整覆盖）
 void GL_RenderRouteToClient(int client)
 {
 	if (!GL_HasRoute() || gGL_Segments == null || gGL_Segments.Length < 2)
@@ -286,19 +286,109 @@ void GL_RenderRouteToClient(int client)
 	int batchSize = GL_GetBatchSize();
 	if (batchSize < 8) batchSize = 8;
 	if (batchSize > 256) batchSize = 256;
+	if (batchSize > totalSegments) batchSize = totalSegments;
 
-	// 本 tick 只发送一批（轮转）
-	int cursor = gGL_SegmentCursor[client];
-	int end = cursor + batchSize;
-	if (end > totalSegments)
+	// 玩家位置（附近优先）
+	float playerOrigin[3];
+	bool playerAlive = IsPlayerAlive(client);
+	if (playerAlive)
 	{
-		end = totalSegments;
+		GetClientAbsOrigin(client, playerOrigin);
 	}
 
-	float seg[6];
-	// 每项 6 cells，段 s 的起点是 s * 6（GetArray 按项索引读，自动乘以块大小）
-	for (int s = cursor; s < end; s++)
+	// 分段：
+	// - 前 min(nearQuota, batchSize) 条：玩家附近段（距离升序）
+	// - 其余：轮转游标补（顺序覆盖所有段）
+	int nearQuota = batchSize / 2; // 附近占批次一半
+
+	// 临时数组（堆分配避免栈溢出）
+	int[] sendOrder = new int[batchSize];
+	int sendCount = 0;
+
+	// —— 第一步：玩家附近段（附近优先）——
+	if (playerAlive && nearQuota >= 4)
 	{
+		int maxNearScan = totalSegments < 4096 ? totalSegments : 4096; // 扫描上限，防卡
+		int[] nearIdx = new int[maxNearScan];
+		float[] nearDist = new float[maxNearScan];
+		int nearCount = 0;
+
+		float nearDistLimit = GL_GetNearDist();
+		for (int s = 0; s < maxNearScan; s++)
+		{
+			float seg[6];
+			gGL_Segments.GetArray(s, seg);
+			float mid[3];
+			mid[0] = (seg[0] + seg[3]) * 0.5;
+			mid[1] = (seg[1] + seg[4]) * 0.5;
+			mid[2] = (seg[2] + seg[5]) * 0.5;
+			float d = GL_Distance3D(mid, playerOrigin);
+			if (d < nearDistLimit)
+			{
+				nearIdx[nearCount] = s;
+				nearDist[nearCount] = d;
+				nearCount++;
+			}
+		}
+
+		// 距离升序简单排序（近段数一般不多；插入排序够用）
+		for (int i = 1; i < nearCount; i++)
+		{
+			int sVal = nearIdx[i];
+			float dVal = nearDist[i];
+			int j = i - 1;
+			while (j >= 0 && nearDist[j] > dVal)
+			{
+				nearIdx[j + 1] = nearIdx[j];
+				nearDist[j + 1] = nearDist[j];
+				j--;
+			}
+			nearIdx[j + 1] = sVal;
+			nearDist[j + 1] = dVal;
+		}
+
+		// 取最近的 nearQuota 个
+		int take = nearCount < nearQuota ? nearCount : nearQuota;
+		for (int i = 0; i < take; i++)
+		{
+			sendOrder[sendCount++] = nearIdx[i];
+		}
+	}
+
+	// —— 第二步：轮转游标补剩余（保证全覆盖）——
+	if (sendCount < batchSize)
+	{
+		int cursor = gGL_SegmentCursor[client];
+		int tries = 0;
+		while (sendCount < batchSize && tries < totalSegments)
+		{
+			int s = cursor + tries;
+			if (s >= totalSegments) s -= totalSegments;
+			// 去重（已在 sendOrder 中）
+			bool dup = false;
+			for (int k = 0; k < sendCount; k++)
+			{
+				if (sendOrder[k] == s)
+				{
+					dup = true;
+					break;
+				}
+			}
+			if (!dup)
+			{
+				sendOrder[sendCount++] = s;
+			}
+			tries++;
+		}
+		// 推进游标：按阶段 B 扫描的段数（tries），避免跳批漏段（阶段 A 已占用部分名额）
+		gGL_SegmentCursor[client] = (gGL_SegmentCursor[client] + tries) % totalSegments;
+	}
+
+	// —— 发送 ——
+	for (int i = 0; i < sendCount; i++)
+	{
+		int s = sendOrder[i];
+		float seg[6];
 		gGL_Segments.GetArray(s, seg);
 		float a[3];
 		a[0] = seg[0]; a[1] = seg[1]; a[2] = seg[2];
@@ -307,10 +397,7 @@ void GL_RenderRouteToClient(int client)
 		DrawBeam(client, a, b, life, width, color);
 	}
 
-	// 推进游标（完成后回绕）
-	gGL_SegmentCursor[client] = (end == totalSegments) ? 0 : end;
-
-	GL_LogDebug("Render batch: %d-%d / %d (tick %d)", cursor, end, totalSegments, gGL_RenderTick);
+	GL_LogDebug("Render batch: %d sent / %d (tick %d)", sendCount, totalSegments, gGL_RenderTick);
 }
 
 // 激光束发送（参数与 GOKZ JumpBeam 完全一致：FadeLength 10、Amplitude 0、Speed 0）
