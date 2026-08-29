@@ -24,7 +24,9 @@
 | 2 | 服务器本地 GOKZ 录像 | `addons/sourcemod/data/gokz-replays/_runs/<map>/`（course 0） |
 | 3 | R2 存储 | `{base}/wr/{<vnl|skz|kzt>}/<map>/<pro|tp>.replay` |
 
-检查时机：换图 3 秒后自动 + `!routerefresh` 手动强制刷新。
+检查时机：换图 3 秒后自动 + `!routerefresh` 手动强制刷新 +
+**本服破纪录保存新录像时自动触发一次检查**（GOKZ_RP_OnReplaySaved，
+仅在 course 0 且比当前路线快时生效，不干扰上游保存流程）。
 
 ### 1.3 显示规则
 

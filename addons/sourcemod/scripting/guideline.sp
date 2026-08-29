@@ -41,6 +41,10 @@
 
 #include <gokz/core>
 
+#undef REQUIRE_PLUGIN
+#include <gokz/replays>
+#define REQUIRE_PLUGIN
+
 #undef REQUIRE_EXTENSIONS
 #include <SteamWorks>
 
@@ -100,6 +104,40 @@ public void OnPluginStart()
 
 	// 渲染定时器：路线常驻重发（与 JumpBeam 的生命周期配合）
 	GL_RestartRenderTimer();
+}
+
+// —— from gokz-replays ——
+// 玩家跑出破纪录录像被永久保存（tempReplay=false）时，
+// 本服最快录像可能更新 → 自动触发一次路线检查（仅 course 0）
+public Action GOKZ_RP_OnReplaySaved(int client, int replayType,
+	const char[] map, int course, int timeType, float time,
+	const char[] filePath, bool tempReplay)
+{
+	// 永远放行，不干扰 gokz-replays 的本地保存与临时文件清理
+	if (replayType != ReplayType_Run || tempReplay || course != 0)
+	{
+		return Plugin_Continue;
+	}
+
+	// 地图必须匹配（避免上一张图延迟触发的 forward 干扰当前路线）
+	char currentMap[64];
+	GetCurrentMap(currentMap, sizeof(currentMap));
+	GL_ToLower(currentMap, sizeof(currentMap));
+	if (!StrEqual(currentMap, map, false))
+	{
+		return Plugin_Continue;
+	}
+
+	// 如果当前路线已加载，且新录像比当前路线更快 → 重新检查
+	float currentTime = 0.0;
+	bool hasRoute = GL_GetCurrentRouteTime(currentTime);
+	if (GL_GetEnabled() && (!hasRoute || time < currentTime))
+	{
+		GL_LogDebug("New faster record saved (%.2fs, was %.2fs) -> recheck route", time, currentTime);
+		GL_CheckRoutes(GL_STRATEGY_AUTO, GetClientUserId(client));
+	}
+
+	return Plugin_Continue;
 }
 
 public void OnAllPluginsLoaded()
