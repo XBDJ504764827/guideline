@@ -96,6 +96,17 @@ void GL_ClearRoute(int mode)
 	gGL_Routes[mode].playerName[0] = '\0';
 }
 
+// 设置当前构建/渲染模式（OnMapStart 时设为服务器默认模式）
+void GL_SetBuildMode(int mode)
+{
+	if (mode < 0 || mode > 2)
+	{
+		mode = GOKZ_GetDefaultMode();
+	}
+	gGL_BuildMode = mode;
+	GL_LogDebug("Build mode set to %d", mode);
+}
+
 // 获取指定模式的路线（不存在则返回 false）
 bool GL_GetRoute(int mode, Route route)
 {
@@ -203,11 +214,7 @@ void GL_RouteFinishParsed(const char[] playerName, float time, int teleports, in
 	gGL_Routes[mode].downloading = false;
 	gGL_Routes[mode].source = gGL_PendingSource;
 
-	// 若该模式是当前构建模式，构建渲染线段缓存
-	if (mode == gGL_BuildMode)
-	{
-		GL_BuildSegmentCache(points);
-	}
+	// 缓存由渲染层按需重建（GL_RenderRouteToClient 中 gGL_CacheMode != mode 时触发）
 
 	// 来源名（日志用）
 	static const char GL_SourceNames[4][8] = { "none", "cache", "local", "remote" };

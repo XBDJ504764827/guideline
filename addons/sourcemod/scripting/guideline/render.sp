@@ -43,6 +43,9 @@ void GL_OnMapStart_Render()
 		gGL_PlayerNearValid[client] = false;
 		gGL_PlayerNearCount[client] = 0;
 	}
+
+	// 设置默认构建模式（消除 gGL_BuildMode 未初始化导致的无参语义错误）
+	GL_SetBuildMode(GOKZ_GetDefaultMode());
 }
 
 // Cookie 缓存完成：恢复开关状态
@@ -122,6 +125,23 @@ public Action GL_Timer_Render(Handle timer)
 		GL_RenderRouteToClient(client);
 	}
 	return Plugin_Continue;
+}
+
+// 为指定模式重建线段缓存（模式切换/路线加载完成时调用）
+void GL_RebuildCacheForMode(int mode)
+{
+	if (mode < 0 || mode > 2)
+	{
+		return;
+	}
+	Route routeInfo;
+	if (!GL_GetRoute(mode, routeInfo) || routeInfo.points == null)
+	{
+		return;
+	}
+	gGL_CacheMode = mode;
+	GL_BuildSegmentCache(routeInfo.points);
+	GL_LogDebug("Segment cache rebuilt for mode %d (%d segments)", mode, gGL_Segments != null ? gGL_Segments.Length : 0);
 }
 
 // 清空线段缓存（换图/重载时）
@@ -286,27 +306,17 @@ static void BuildSegmentsFromSequence(ArrayList seq, int iter)
 // 附近优先解决"玩家附近不显示"；轮转解决"时有时无"（完整覆盖）
 void GL_RenderRouteToClient(int client)
 {
-	if (!GL_HasRoute())
-	{
-		return;
-	}
-
-	// 按玩家当前模式获取路线；若线段缓存尚未为该模式构建则重建
+	// 按玩家当前模式获取路线（无参调用语义不明确，必须带模式）
 	int mode = GOKZ_GetCoreOption(client, Option_Mode);
 	if (!GL_HasRoute(mode))
 	{
 		return; // 该模式无路线（渲染由 EnsureRoute 触发加载）
 	}
+
+	// 线段缓存尚未为该模式构建则重建
 	if (gGL_Segments == null || gGL_Segments.Length < 2 || gGL_CacheMode != mode)
 	{
-		// 该模式已加载但缓存未构建（或模式不符）→ 重建
-		gGL_CacheMode = mode;
-		Route routeInfo;
-		GL_GetRoute(mode, routeInfo);
-		if (routeInfo.points != null)
-		{
-			GL_BuildSegmentCache(routeInfo.points);
-		}
+		GL_RebuildCacheForMode(mode);
 	}
 
 	if (gGL_Segments == null || gGL_Segments.Length < 2)

@@ -120,10 +120,18 @@ void GL_OnModeChanged(int client, int newMode)
 		return;
 	}
 
-	// 该模式下已有路线则无需重复下载（防止来回切模式反复请求）
+	// 清空旧线段缓存（防止新模式加载完成前继续显示旧模式路线）
+	GL_ClearSegmentCache();
+	// 重置该玩家附近段缓存（缓存可能属于旧模式）
+	gGL_PlayerNearValid[client] = false;
+	gGL_PlayerNearCount[client] = 0;
+
+	// 该模式下已有路线则无虚重复下载（防止来回切模式反复请求）
+	// 但需要立即重建该模式的线段缓存（旧缓存已清空）
 	if (GL_HasRoute(newMode))
 	{
 		GL_LogDebug("Mode changed to %d but route already loaded (client %d)", newMode, client);
+		GL_RebuildCacheForMode(newMode);
 		return;
 	}
 
