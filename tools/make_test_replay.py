@@ -107,19 +107,30 @@ def main():
     buf += bytes([course])             # course
     buf += struct.pack("<i", teleports)  # teleportsUsed
 
-    # Tick data: 直线轨迹（每 tick +8 units），含起跳点与传送断点
+    # Tick data: 双层地图轨迹（每 tick +8 units），含起跳点与传送断点
+    # 场景：上层 z=512 走 200 ticks → 瞬间切换到下层 z=0 走 100 ticks → 回到上层
+    # 这样能验证双层地图的垂直断点逻辑
     prev_fields = None
     for tick in range(n_ticks):
         x = tick * 8.0
         y = 0.0
-        z = 64.0
-        if tick == 250:
-            # 传送：跳跃到 (2000, 0, 0) 后的位置
-            x = 2000.0
-            flags = FLAG_ONGROUND | FLAG_TELEPORT
-        else:
+        if tick < 200:
+            z = 512.0  # 上层
             flags = FLAG_ONGROUND
-            if tick == 100 or tick == 300:
+            if tick == 100:
+                flags |= FLAG_TAKEOFF
+        elif tick == 200:
+            z = 0.0  # 瞬间切换到下层
+            flags = FLAG_ONGROUND | FLAG_TELEPORT
+        elif tick < 300:
+            z = 0.0  # 下层
+            flags = FLAG_ONGROUND
+            if tick == 250:
+                flags |= FLAG_TAKEOFF
+        else:
+            z = 512.0  # 瞬间回上层
+            flags = FLAG_ONGROUND
+            if tick == 350:
                 flags |= FLAG_TAKEOFF
         fields = [0] * RP_TICK_BLOCK
         fields[RPDELTA["VEL_X"]] = f2i(300.0)

@@ -15,6 +15,7 @@ enum struct TrackPoint
 	float origin[3];
 	bool isTakeoff; // 起跳帧（flags bit 23）
 	bool isTeleport; // 传送帧（flags bit 22）→ 断点
+	bool isBreak;  // 断点标记（双层错位/传送/距离断，渲染据此断开连线）
 	int tick; // 原始录像 tick 索引
 }
 
@@ -148,6 +149,7 @@ ArrayList GL_Downsample(ArrayList raw)
 
 	float sampleDist = GL_GetSampleDist();
 	float breakDist = GL_GetBreakDist();
+	float verticalBreakDist = GL_GetVerticalBreakDist();
 
 	TrackPoint last;
 	raw.GetArray(0, last);
@@ -160,18 +162,25 @@ ArrayList GL_Downsample(ArrayList raw)
 		TrackPoint tp;
 		raw.GetArray(i, tp);
 
-		float dist = GL_HorizontalDistance(tp.origin, lastOrigin);
+		// 使用 3D 距离：双层地图上层/下层水平距离近但垂直距离大，
+		// 水平距离会错误合并上下层点；3D 距离可正确区分
+		float dist = GL_Distance3D(tp.origin, lastOrigin);
 
 		// 断点：保留（标记断开，绘制时跳过连线）
-		if (dist > breakDist)
+		// 双层场景：水平距离近但垂直距离突变（> verticalBreakDist）也视为断点
+		float vertDelta = FloatAbs(tp.origin[2] - lastOrigin[2]);
+		bool verticalBreak = vertDelta > verticalBreakDist
+			&& GL_HorizontalDistance(tp.origin, lastOrigin) < 64.0;
+		if (dist > breakDist || verticalBreak || tp.isTeleport)
 		{
+			tp.isBreak = true;
 			result.PushArray(tp);
 			lastOrigin = tp.origin;
 			continue;
 		}
 
 		// 起跳点/传送点强制保留；其余按距离抽稀
-		if (tp.isTakeoff || tp.isTeleport || dist >= sampleDist)
+		if (tp.isTakeoff || dist >= sampleDist)
 		{
 			result.PushArray(tp);
 			lastOrigin = tp.origin;

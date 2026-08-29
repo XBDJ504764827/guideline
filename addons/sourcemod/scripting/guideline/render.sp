@@ -104,6 +104,7 @@ void GL_RenderRouteToClient(int client)
 
 	int maxSegments = GL_GetMaxSegments();
 	float breakDist = GL_GetBreakDist();
+	float verticalBreakDist = GL_GetVerticalBreakDist();
 
 	int color[4];
 	GL_GetColor(color);
@@ -140,9 +141,30 @@ void GL_RenderRouteToClient(int client)
 			TrackPoint prev, cur;
 			points.GetArray(ptIdx - 1, prev);
 			points.GetArray(ptIdx, cur);
-			if (GL_HorizontalDistance(prev.origin, cur.origin) > breakDist)
+
+			// 优先使用降采样时确定的断点标记（双层/传送/距离断点）
+			if (cur.isBreak)
 			{
 				needFlushBefore = true;
+			}
+			// 兜底：3D 距离断点（渲染时点序变化导致标记失效的情况）
+			else
+			{
+				float dist = GL_Distance3D(prev.origin, cur.origin);
+				if (dist > breakDist)
+				{
+					needFlushBefore = true;
+				}
+				// 双层场景：水平距离近但垂直距离突变也断开
+				else
+				{
+					float vertDelta = FloatAbs(cur.origin[2] - prev.origin[2]);
+					if (vertDelta > verticalBreakDist
+						&& GL_HorizontalDistance(prev.origin, cur.origin) < 64.0)
+					{
+						needFlushBefore = true;
+					}
+				}
 			}
 		}
 

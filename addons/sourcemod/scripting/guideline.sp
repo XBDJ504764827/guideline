@@ -60,7 +60,7 @@
 public Plugin myinfo =
 {
 	name = "Guideline",
-	author = "XBDJ",
+	author = "XBDJ504764827",
 	description = "GOKZ jump map route guide driven by fastest replay (cache / local / R2)",
 	version = GL_VERSION,
 	url = ""

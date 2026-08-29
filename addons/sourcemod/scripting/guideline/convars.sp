@@ -21,6 +21,7 @@ ConVar gCV_Smooth;
 ConVar gCV_SmoothPoints;
 ConVar gCV_SampleDist;
 ConVar gCV_BreakDist;
+ConVar gCV_VerticalBreakDist;
 ConVar gCV_MaxSegments;
 ConVar gCV_ParseBatch;
 ConVar gCV_MetaTimeout;
@@ -67,7 +68,9 @@ void GL_CreateConVars()
 	gCV_SampleDist = AutoExecConfig_CreateConVar("gokz_guideline_sample_dist", "32.0",
 		"轨迹降采样距离阈值（units）：相邻保留点水平距离小于该值则丢弃（起跳点除外）。", _, true, 8.0, true, 512.0);
 	gCV_BreakDist = AutoExecConfig_CreateConVar("gokz_guideline_break_dist", "1000.0",
-		"轨迹断点判定距离（units）：相邻两点水平距离超过该值视为断点（传送/异常），绘制时断开。", _, true, 100.0, true, 5000.0);
+		"轨迹断点判定距离（units）：相邻两点 3D 距离超过该值视为断点（传送/异常），绘制时断开。", _, true, 100.0, true, 5000.0);
+	gCV_VerticalBreakDist = AutoExecConfig_CreateConVar("gokz_guideline_vertical_break_dist", "300.0",
+		"双层断点判定距离（units）：相邻两点水平距离 < 64 但垂直距离超过该值视为断点（上下层错位），绘制时断开。", _, true, 100.0, true, 2000.0);
 	gCV_MaxSegments = AutoExecConfig_CreateConVar("gokz_guideline_max_segments", "2000",
 		"完整路线最大绘制线段数上限（保护上限，超出则自动降低平滑迭代仍保持全图）。", _, true, 16.0, true, 5000.0);
 	gCV_ParseBatch = AutoExecConfig_CreateConVar("gokz_guideline_parse_batch", "5000",
@@ -145,6 +148,11 @@ float GL_GetSampleDist()
 float GL_GetBreakDist()
 {
 	return gCV_BreakDist.FloatValue;
+}
+
+float GL_GetVerticalBreakDist()
+{
+	return gCV_VerticalBreakDist.FloatValue;
 }
 
 int GL_GetMaxSegments()
