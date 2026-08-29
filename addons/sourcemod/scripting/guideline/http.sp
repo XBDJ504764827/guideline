@@ -410,6 +410,7 @@ public void OnDownloadComplete(Handle hRequest, bool bFailure, bool bRequestSucc
 	// 进入分帧解析管线
 	gGL_MetaBusy = false;
 	GL_LogDebug("Download OK: %d bytes (sha=%.12s)", bodySize, sha256);
+	GL_SetPendingSource(GL_SOURCE_REMOTE);
 	GL_StartParsing(path, 0, mode, requesterUserID);
 }
 
