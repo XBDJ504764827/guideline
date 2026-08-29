@@ -16,15 +16,17 @@ ConVar gCV_Debug;
 ConVar gCV_Color;
 ConVar gCV_BeamLifetime;
 ConVar gCV_BeamWidth;
-ConVar gCV_RefreshInterval;
 ConVar gCV_Smooth;
 ConVar gCV_SmoothPoints;
 ConVar gCV_SampleDist;
 ConVar gCV_BreakDist;
+ConVar gCV_VerticalBreakDist;
 ConVar gCV_MaxSegments;
 ConVar gCV_ParseBatch;
 ConVar gCV_MetaTimeout;
 ConVar gCV_DownloadTimeout;
+ConVar gCV_BatchSize;
+ConVar gCV_NearDist;
 
 
 
@@ -58,16 +60,16 @@ void GL_CreateConVars()
 		"线条存活时间（秒），与 GOKZ JumpBeam 一致。" , _, true, 0.5, true, 10.0);
 	gCV_BeamWidth = AutoExecConfig_CreateConVar("gokz_guideline_beam_width", "0.25",
 		"线条宽度（与 GOKZ JumpBeam 一致）。", _, true, 0.1, true, 8.0);
-	gCV_RefreshInterval = AutoExecConfig_CreateConVar("gokz_guideline_refresh_interval", "2.0",
-		"路线重发光束的刷新间隔（秒），需小于 beam_lifetime 避免闪烁。", _, true, 0.5, true, 5.0);
 	gCV_Smooth = AutoExecConfig_CreateConVar("gokz_guideline_smooth", "1",
 		"路线平滑开关：Chaikin 角切割细分，拐角处切出圆角（与 JumpBeam 视觉一致）。", _, true, 0.0, true, 1.0);
-	gCV_SmoothPoints = AutoExecConfig_CreateConVar("gokz_guideline_smooth_points", "1",
-		"Chaikin 细分迭代次数（0-3）：越大越圆润，每迭代一次段数约 ×2。", _, true, 0.0, true, 3.0);
+	gCV_SmoothPoints = AutoExecConfig_CreateConVar("gokz_guideline_smooth_points", "2",
+		"Chaikin 细分迭代次数（0-3）：越大越圆润，每迭代一次段数约 ×2（默认 2 次圆角清晰）。", _, true, 0.0, true, 3.0);
 	gCV_SampleDist = AutoExecConfig_CreateConVar("gokz_guideline_sample_dist", "32.0",
 		"轨迹降采样距离阈值（units）：相邻保留点水平距离小于该值则丢弃（起跳点除外）。", _, true, 8.0, true, 512.0);
 	gCV_BreakDist = AutoExecConfig_CreateConVar("gokz_guideline_break_dist", "1000.0",
-		"轨迹断点判定距离（units）：相邻两点水平距离超过该值视为断点（传送/异常），绘制时断开。", _, true, 100.0, true, 5000.0);
+		"轨迹断点判定距离（units）：相邻两点 3D 距离超过该值视为断点（传送/异常），绘制时断开。", _, true, 100.0, true, 5000.0);
+	gCV_VerticalBreakDist = AutoExecConfig_CreateConVar("gokz_guideline_vertical_break_dist", "300.0",
+		"双层断点判定距离（units）：相邻两点水平距离 < 64 但垂直距离超过该值视为断点（上下层错位），绘制时断开。", _, true, 100.0, true, 2000.0);
 	gCV_MaxSegments = AutoExecConfig_CreateConVar("gokz_guideline_max_segments", "2000",
 		"完整路线最大绘制线段数上限（保护上限，超出则自动降低平滑迭代仍保持全图）。", _, true, 16.0, true, 5000.0);
 	gCV_ParseBatch = AutoExecConfig_CreateConVar("gokz_guideline_parse_batch", "5000",
@@ -76,11 +78,13 @@ void GL_CreateConVars()
 		"R2 meta 查询超时（秒）。", _, true, 3.0, true, 60.0);
 	gCV_DownloadTimeout = AutoExecConfig_CreateConVar("gokz_guideline_download_timeout", "30",
 		"R2 录像下载超时（秒）。", _, true, 5.0, true, 120.0);
+	gCV_BatchSize = AutoExecConfig_CreateConVar("gokz_guideline_batch_size", "160",
+		"每渲染周期发送的最大线段数（分批滚动发送，防止一次性发送过多被客户端丢弃；\n		建议 段数/批数×刷新间隔 < beam_lifetime 保证连续显示）。", _, true, 8.0, true, 256.0);
+	gCV_NearDist = AutoExecConfig_CreateConVar("gokz_guideline_near_dist", "2000.0",
+		"玩家附近优先显示距离（units）：距玩家小于该距离的路线段优先发送，\n		保证玩家所在位置附近的路线始终可见（隔批滞后不闪烁）。", _, true, 100.0, true, 10000.0);
 
 	AutoExecConfig_ExecuteFile();
 	AutoExecConfig_CleanFile();
-
-	HookConVarChange(gCV_RefreshInterval, OnRefreshIntervalChanged);
 }
 
 void GL_CreateCookies()
@@ -88,10 +92,7 @@ void GL_CreateCookies()
 	gH_EnabledCookie = new Cookie("gokz-guideline-enabled", "Guideline route display enabled (per player)", CookieAccess_Private);
 }
 
-public void OnRefreshIntervalChanged(ConVar convar, const char[] oldValue, const char[] newValue)
-{
-	GL_RestartRenderTimer();
-}
+
 
 
 
@@ -122,11 +123,6 @@ float GL_GetBeamWidth()
 	return gCV_BeamWidth.FloatValue;
 }
 
-float GL_GetRefreshInterval()
-{
-	return gCV_RefreshInterval.FloatValue;
-}
-
 bool GL_GetSmooth()
 {
 	return gCV_Smooth.BoolValue;
@@ -147,6 +143,11 @@ float GL_GetBreakDist()
 	return gCV_BreakDist.FloatValue;
 }
 
+float GL_GetVerticalBreakDist()
+{
+	return gCV_VerticalBreakDist.FloatValue;
+}
+
 int GL_GetMaxSegments()
 {
 	return gCV_MaxSegments.IntValue;
@@ -165,6 +166,16 @@ int GL_GetMetaTimeout()
 int GL_GetDownloadTimeout()
 {
 	return gCV_DownloadTimeout.IntValue;
+}
+
+int GL_GetBatchSize()
+{
+	return gCV_BatchSize.IntValue;
+}
+
+float GL_GetNearDist()
+{
+	return gCV_NearDist.FloatValue;
 }
 
 void GL_GetColor(int color[4])

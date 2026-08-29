@@ -60,7 +60,7 @@
 public Plugin myinfo =
 {
 	name = "Guideline",
-	author = "XBDJ",
+	author = "XBDJ504764827",
 	description = "GOKZ jump map route guide driven by fastest replay (cache / local / R2)",
 	version = GL_VERSION,
 	url = ""
@@ -155,6 +155,16 @@ public void OnAllPluginsLoaded()
 		{
 			GL_EnsureRouteForClient(client);
 		}
+	}
+}
+
+// —— from gokz-core ——
+// 玩家切换 GOKZ 模式（KZT/SKZ/VNL）时，加载新模式对应的路线
+public void GOKZ_OnOptionChanged(int client, const char[] option, any newValue)
+{
+	if (StrEqual(option, "GOKZ - Mode", false))
+	{
+		GL_OnModeChanged(client, view_as<int>(newValue));
 	}
 }
 

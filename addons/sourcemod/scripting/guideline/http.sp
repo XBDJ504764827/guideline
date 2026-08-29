@@ -10,21 +10,17 @@
 	路径约定（与 stratosphere 完全对齐）：
 	  {base}/wr/{mode}/{map}/{type}.replay
 	- base ：gokz_guideline_url（R2 基础 URL，域名 + 可选前缀）
-	- mode ：请求的 GOKZ 模式（vnl/skz/kzt），默认用服务器默认模式，且自动遍历
+	- mode ：请求的 GOKZ 模式（vnl/skz/kzt），优先请求玩家当前模式
 	- map  ：服务器当前地图（小写，URLEncode）
 	- type ：pro / tp（优先 pro；meta 404 后回退 tp）
 
 	鉴权：gokz_guideline_api_key 非空时携带 X-API-Key 头（与 stratosphere 一致）。
 
-	【三方对比策略】
-	  GL_DownloadRoute 被调用时：
-	  1. 先扫描本地 GOKZ 录像（localreplay.sp）取 time_local；
-	  2. 若本地已有路线缓存（routes.sp），取其 time_cache；
-	  3. meta 查询 R2 得 time_remote；
-	  4. 三者取最小 → 若最小者是本地录像则直接用本地解析（无下载）；
-	     若最小者是 R2（且与缓存 sha 不同）则下载 body 覆盖缓存；
-	     否则直接用现有缓存。
-	  404 → 回退 tp 格式 → 仍无则只用本地/缓存。
+	【按模式加载（KZT/SKZ/VNL 路线不同）】
+	  GL_CheckRoutes(strategy, mode)：按指定模式加载路线
+	  三方对比（该模式）：本地录像 / 该模式缓存 / 该模式 R2，取最小 time
+	  玩家切换 GOKZ 模式时（guideline.sp 的 GOKZ_OnOptionChanged），
+	  自动用新模式重新检查加载。
 */
 
 
@@ -35,8 +31,8 @@
 #define GL_MAX_KEY_LENGTH 128
 #define GL_SHA256_LENGTH 128
 
-// 模式遍历顺序（按 GOKZ 默认模式优先）：
-// 0 = 服务器默认模式, 1/2 = 其余两种
+// 模式遍历顺序（按目标模式优先）：
+// modeIdx 0 = 目标模式, 1/2 = 其余两种
 #define GL_MODE_COUNT 3
 
 
@@ -44,6 +40,7 @@
 // =====[ STATE ]=====
 
 bool gGL_MetaBusy; // 防重入：同一时间只允许一个 meta 查询流程
+int gGL_TargetMode; // 本次请求的目标模式（0=VNL 1=SKZ 2=KZT）
 
 enum
 {
@@ -56,15 +53,31 @@ enum
 
 // =====[ PUBLIC ]=====
 
-// 检查并加载当前地图最快路线（自动/手动统一入口）
+// 检查并加载指定模式的路线（自动/手动统一入口）
 // 优先本地录像 → 否则走 meta+缓存 → 最后回退下载 R2
-void GL_CheckRoutes(int strategy, int requesterUserID = 0)
+// mode < 0 时使用玩家当前模式（requesterUserID > 0）或服务器默认模式
+void GL_CheckRoutes(int strategy, int requesterUserID = 0, int mode = -1)
 {
+	// 确定目标模式
+	if (mode < 0 || mode > 2)
+	{
+		int requester = GetClientOfUserId(requesterUserID);
+		if (requester != 0 && GL_IsValidClient(requester))
+		{
+			mode = GOKZ_GetCoreOption(requester, Option_Mode);
+		}
+		else
+		{
+			mode = GOKZ_GetDefaultMode();
+		}
+	}
+	gGL_TargetMode = mode;
+
 	// 无 SteamWorks 时仍可用本地录像（只跳过 R2 阶段）
 	if (!gB_SteamWorksOK)
 	{
 		GL_LogError("CheckRoutes: SteamWorks not available, using local replay only");
-		FinishWithLocalOrCache(requesterUserID);
+		FinishWithLocalOrCache(requesterUserID, mode);
 		return;
 	}
 
@@ -83,19 +96,50 @@ void GL_CheckRoutes(int strategy, int requesterUserID = 0)
 	}
 
 	// 记录请求场景（自动/手动/按需），供调试使用
-	GL_LogDebug("CheckRoutes: strategy=%d requester=%d", strategy, requesterUserID);
-	GL_MetaStart(requesterUserID, 0); // modeIdx=0 = 服务器默认模式
+	GL_LogDebug("CheckRoutes: strategy=%d requester=%d mode=%d", strategy, requesterUserID, mode);
+	GL_MetaStart(requesterUserID, 0); // modeIdx=0 = 目标模式
 }
 
-// 手动刷新（!routerefresh）：清除当前路线并重新检查
-void GL_ForceRefresh(int client)
+// 手动刷新（!routerefresh）：清空指定模式路线并重新检查
+void GL_ForceRefresh(int client, int mode = -1)
 {
-	GL_ClearCurrentRoute();
-	GL_CheckRoutes(GL_STRATEGY_USER, GetClientUserId(client));
-	GL_Chat(client, "{green}正在重新检查本图路线（本地录像 → R2）...");
+	if (mode < 0 || mode > 2)
+	{
+		mode = GOKZ_GetCoreOption(client, Option_Mode);
+	}
+	GL_ClearRoute(mode);
+	GL_CheckRoutes(GL_STRATEGY_USER, GetClientUserId(client), mode);
+	GL_Chat(client, "{green}正在重新检查本图 {default}%s{green} 模式路线（本地录像 → R2）...", gC_ModeNamesShort[mode]);
 }
 
-// 确保当前地图已加载路线（未加载则触发检查；已加载则渲染定时器自动显示）
+// 玩家切换 GOKZ 模式：加载新模式对应的路线
+void GL_OnModeChanged(int client, int newMode)
+{
+	if (!GL_GetEnabled())
+	{
+		return;
+	}
+
+	// 清空旧线段缓存（防止新模式加载完成前继续显示旧模式路线）
+	GL_ClearSegmentCache();
+	// 重置该玩家附近段缓存（缓存可能属于旧模式）
+	gGL_PlayerNearValid[client] = false;
+	gGL_PlayerNearCount[client] = 0;
+
+	// 该模式下已有路线则无虚重复下载（防止来回切模式反复请求）
+	// 但需要立即重建该模式的线段缓存（旧缓存已清空）
+	if (GL_HasRoute(newMode))
+	{
+		GL_LogDebug("Mode changed to %d but route already loaded (client %d)", newMode, client);
+		GL_RebuildCacheForMode(newMode);
+		return;
+	}
+
+	GL_LogDebug("Mode changed to %d (client %d)", newMode, client);
+	GL_CheckRoutes(GL_STRATEGY_ENSURE, GetClientUserId(client), newMode);
+}
+
+// 确保目标模式已加载路线（未加载则触发检查）
 void GL_EnsureRouteForClient(int client)
 {
 	if (!GL_GetEnabled())
@@ -103,13 +147,14 @@ void GL_EnsureRouteForClient(int client)
 		return;
 	}
 
-	if (GL_HasRoute())
+	int mode = GOKZ_GetCoreOption(client, Option_Mode);
+	if (GL_HasRoute(mode))
 	{
-		return; // 已有路线
+		return; // 已有该模式路线
 	}
 
-	// 触发路线加载（自动 + 手动场景共用；http.sp 内部有防重入）
-	GL_CheckRoutes(GL_STRATEGY_ENSURE, GetClientUserId(client));
+	// 触发路线加载
+	GL_CheckRoutes(GL_STRATEGY_ENSURE, GetClientUserId(client), mode);
 }
 
 
@@ -217,7 +262,7 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 		// 全部 404：只保留本地录像（若存在）
 		GL_LogDebug("Meta all-404 for %s; falling back to local replay", gC_MapName);
 		gGL_MetaBusy = false;
-		FinishWithLocalOrCache(requesterUserID);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
 		delete hRequest;
 		return;
 	}
@@ -228,7 +273,7 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 		gGL_MetaBusy = false;
 		GL_LogError("Meta request failed: mode=%d type=%d failure=%d successful=%d status=%d",
 			mode, typeIdx, bFailure ? 1 : 0, bRequestSuccessful ? 1 : 0, view_as<int>(eStatusCode));
-		FinishWithLocalOrCache(requesterUserID);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
 		delete hRequest;
 		return;
 	}
@@ -239,7 +284,7 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 	if (bodySize <= 0 || bodySize > 4096)
 	{
 		gGL_MetaBusy = false;
-		FinishWithLocalOrCache(requesterUserID);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
 		delete hRequest;
 		return;
 	}
@@ -255,14 +300,15 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 	float remoteTime = remoteTimeMs > 0 ? float(remoteTimeMs) / 1000.0 : 0.0;
 	GL_LogDebug("Meta OK: mode=%d type=%d time_ms=%d sha=%.12s", mode, typeIdx, remoteTimeMs, remoteSha);
 
-	// ===== 三方对比 =====
-	// 本地录像 / 缓存录像 / R2 录像，取最小 time
+	// ===== 三方对比（针对目标模式） =====
+	// 本地录像 / 该模式缓存 / 该模式 R2，取最小 time
+	int targetMode = gGL_TargetMode;
 	char localPath[PLATFORM_MAX_PATH];
 	float localTime = 0.0;
 	bool hasLocal = GL_FindFastestLocalReplay(localPath, sizeof(localPath), localTime);
 
 	float cacheTime = 0.0;
-	bool hasCache = GL_GetCurrentRouteTime(cacheTime);
+	bool hasCache = GL_GetCurrentRouteTime(cacheTime, targetMode);
 
 	// 选最优来源
 	// 优先级：R2 > 缓存 > 本地（time 小者胜）
@@ -281,7 +327,7 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 		bestTime = cacheTime;
 		bestSource = GL_SOURCE_CACHE;
 		char cachePath[PLATFORM_MAX_PATH];
-		GL_BuildCachePath(cachePath, sizeof(cachePath));
+		GL_BuildCachePath(cachePath, sizeof(cachePath), targetMode);
 		strcopy(bestPath, sizeof(bestPath), cachePath);
 	}
 	if (remoteTime > 0.0 && (bestTime == 0.0 || remoteTime < bestTime))
@@ -293,23 +339,59 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 	GL_LogDebug("Comparison: local=%.2f cache=%.2f remote=%.2f -> best source=%d",
 		localTime, cacheTime, remoteTime, bestSource);
 
+	// 情况 A：远程存在但无时间信息（time_ms=null）→ 无条件下载（下载后从录像
+	// header 解析真实时间，与本地/缓存再比较）。
+	// 只有一个例外：sha256 与缓存一致时可跳过下载直接用缓存（缓存即远程映像）。
+	if (remoteTimeMs <= 0 && remoteSha[0] != '\0')
+	{
+		char shaPath[PLATFORM_MAX_PATH];
+		GL_BuildCacheShaPath(shaPath, sizeof(shaPath), targetMode);
+		char cachedSha[GL_SHA256_LENGTH];
+		ReadShaFile(shaPath, cachedSha, sizeof(cachedSha));
+
+		char cachePath3[PLATFORM_MAX_PATH];
+		GL_BuildCachePath(cachePath3, sizeof(cachePath3), targetMode);
+		if (StrEqual(remoteSha, cachedSha, false) && FileExists(cachePath3))
+		{
+			gGL_MetaBusy = false;
+			GL_LogDebug("Remote has no time_ms but sha matches cache; using cache");
+			GL_SetPendingSource(GL_SOURCE_CACHE);
+			GL_SetPendingMode(targetMode);
+			GL_StartParsing(cachePath3, 0, mode, requesterUserID);
+			return;
+		}
+
+		// 无缓存或 sha 不一致 → 下载
+		char url[GL_MAX_URL_LENGTH];
+		if (!GL_BuildURL(url, sizeof(url), mode, typeIdx))
+		{
+			gGL_MetaBusy = false;
+			FinishWithLocalOrCache(requesterUserID, targetMode);
+			return;
+		}
+		GL_LogDebug("Remote exists but no time info; downloading to inspect");
+		StartDownload(mode, requesterUserID, url);
+		return;
+	}
+
 	if (bestSource == GL_SOURCE_REMOTE)
 	{
 		// R2 最快：sha 与缓存一致 → 直接解析缓存；不一致 → 下载 body
 		if (remoteSha[0] != '\0')
 		{
 			char shaPath[PLATFORM_MAX_PATH];
-			GL_BuildCacheShaPath(shaPath, sizeof(shaPath));
+			GL_BuildCacheShaPath(shaPath, sizeof(shaPath), targetMode);
 			char cachedSha[GL_SHA256_LENGTH];
 			ReadShaFile(shaPath, cachedSha, sizeof(cachedSha));
 
 			char cachePath2[PLATFORM_MAX_PATH];
-			GL_BuildCachePath(cachePath2, sizeof(cachePath2));
+			GL_BuildCachePath(cachePath2, sizeof(cachePath2), targetMode);
 			if (StrEqual(remoteSha, cachedSha, false) && FileExists(cachePath2))
 			{
 				gGL_MetaBusy = false;
 				GL_LogDebug("Cache up-to-date (sha match), using cache");
 				GL_SetPendingSource(GL_SOURCE_CACHE);
+				GL_SetPendingMode(targetMode);
 				GL_StartParsing(cachePath2, 0, mode, requesterUserID);
 				return;
 			}
@@ -320,7 +402,7 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 		if (!GL_BuildURL(url, sizeof(url), mode, typeIdx))
 		{
 			gGL_MetaBusy = false;
-			FinishWithLocalOrCache(requesterUserID);
+			FinishWithLocalOrCache(requesterUserID, targetMode);
 			return;
 		}
 		StartDownload(mode, requesterUserID, url);
@@ -332,20 +414,22 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 	if (bestSource == GL_SOURCE_LOCAL)
 	{
 		GL_SetPendingSource(GL_SOURCE_LOCAL);
+		GL_SetPendingMode(targetMode);
 		GL_ChatToRequester(requesterUserID, "{lime}使用本服最快录像（{default}%.2f 秒{lime}）。", bestTime);
 		GL_StartParsing(bestPath, 0, mode, requesterUserID);
 	}
 	else if (bestSource == GL_SOURCE_CACHE)
 	{
 		GL_SetPendingSource(GL_SOURCE_CACHE);
+		GL_SetPendingMode(targetMode);
 		GL_ChatToRequester(requesterUserID, "{grey}使用缓存录像（{default}%.2f 秒{grey}）。", bestTime);
 		char cachePath[PLATFORM_MAX_PATH];
-		GL_BuildCachePath(cachePath, sizeof(cachePath));
+		GL_BuildCachePath(cachePath, sizeof(cachePath), targetMode);
 		GL_StartParsing(cachePath, 0, mode, requesterUserID);
 	}
 	else
 	{
-		FinishWithLocalOrCache(requesterUserID);
+		FinishWithLocalOrCache(requesterUserID, targetMode);
 	}
 }
 
@@ -368,7 +452,7 @@ public void OnDownloadComplete(Handle hRequest, bool bFailure, bool bRequestSucc
 		gGL_MetaBusy = false;
 		GL_LogError("Download failed: failure=%d successful=%d status=%d",
 			bFailure ? 1 : 0, bRequestSuccessful ? 1 : 0, view_as<int>(eStatusCode));
-		FinishWithLocalOrCache(requesterUserID);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
 		delete hRequest;
 		return;
 	}
@@ -379,20 +463,20 @@ public void OnDownloadComplete(Handle hRequest, bool bFailure, bool bRequestSucc
 	{
 		gGL_MetaBusy = false;
 		GL_LogError("Downloaded body size out of range (%d)", bodySize);
-		FinishWithLocalOrCache(requesterUserID);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
 		delete hRequest;
 		return;
 	}
 
 	// 响应体直接流式写入磁盘缓存（不占 SM 堆内存）
 	char path[PLATFORM_MAX_PATH];
-	GL_BuildCachePath(path, sizeof(path));
+	GL_BuildCachePath(path, sizeof(path), gGL_TargetMode);
 	EnsureCacheDir();
 	if (!SteamWorks_WriteHTTPResponseBodyToFile(hRequest, path))
 	{
 		gGL_MetaBusy = false;
 		GL_LogError("Failed to write downloaded replay to disk: %s", path);
-		FinishWithLocalOrCache(requesterUserID);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
 		delete hRequest;
 		return;
 	}
@@ -404,13 +488,14 @@ public void OnDownloadComplete(Handle hRequest, bool bFailure, bool bRequestSucc
 
 	// 记录 sha256（供下次 meta 比对）
 	char shaPath[PLATFORM_MAX_PATH];
-	GL_BuildCacheShaPath(shaPath, sizeof(shaPath));
+	GL_BuildCacheShaPath(shaPath, sizeof(shaPath), gGL_TargetMode);
 	WriteShaFile(shaPath, sha256);
 
 	// 进入分帧解析管线
 	gGL_MetaBusy = false;
 	GL_LogDebug("Download OK: %d bytes (sha=%.12s)", bodySize, sha256);
 	GL_SetPendingSource(GL_SOURCE_REMOTE);
+	GL_SetPendingMode(gGL_TargetMode);
 	GL_StartParsing(path, 0, mode, requesterUserID);
 }
 
@@ -425,7 +510,7 @@ static void StartDownload(int mode, int requesterUserID, const char[] url)
 	{
 		gGL_MetaBusy = false;
 		GL_LogError("Failed to create download request: %s", url);
-		FinishWithLocalOrCache(requesterUserID);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
 		return;
 	}
 
@@ -453,7 +538,7 @@ static void StartDownload(int mode, int requesterUserID, const char[] url)
 		delete hRequest;
 		gGL_MetaBusy = false;
 		GL_LogError("Failed to send download request: %s", url);
-		FinishWithLocalOrCache(requesterUserID);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
 	}
 }
 
@@ -463,33 +548,35 @@ static void GL_MetaFail(const char[] reason, int requesterUserID)
 {
 	GL_LogError("%s", reason);
 	gGL_MetaBusy = false;
-	FinishWithLocalOrCache(requesterUserID);
+	FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
 }
 
-// meta 全部失败/404 时的最终兜底：本地录像 → 缓存 → 无
-static void FinishWithLocalOrCache(int requesterUserID)
+// meta 全部失败/404 时的最终兜底：本地录像 → 该模式缓存 → 无
+static void FinishWithLocalOrCache(int requesterUserID, int mode)
 {
 	char localPath[PLATFORM_MAX_PATH];
 	float localTime = 0.0;
 	if (GL_FindFastestLocalReplay(localPath, sizeof(localPath), localTime))
 	{
 		GL_SetPendingSource(GL_SOURCE_LOCAL);
+		GL_SetPendingMode(mode);
 		GL_ChatToRequester(requesterUserID, "{lime}使用本服最快录像（{default}%.2f 秒{lime}）。", localTime);
-		GL_StartParsing(localPath, 0, GOKZ_GetDefaultMode(), requesterUserID);
+		GL_StartParsing(localPath, 0, mode, requesterUserID);
 		return;
 	}
 
 	char cachePath[PLATFORM_MAX_PATH];
-	GL_BuildCachePath(cachePath, sizeof(cachePath));
+	GL_BuildCachePath(cachePath, sizeof(cachePath), mode);
 	if (FileExists(cachePath))
 	{
 		GL_SetPendingSource(GL_SOURCE_CACHE);
+		GL_SetPendingMode(mode);
 		GL_ChatToRequester(requesterUserID, "{grey}使用缓存录像。");
-		GL_StartParsing(cachePath, 0, GOKZ_GetDefaultMode(), requesterUserID);
+		GL_StartParsing(cachePath, 0, mode, requesterUserID);
 		return;
 	}
 
-	GL_ChatToRequester(requesterUserID, "{darkred}未找到本图路线（本地无录像，R2 无录像）。");
+	GL_ChatToRequester(requesterUserID, "{darkred}未找到本图 %s 模式路线（本地无录像，R2 无录像）。", gC_ModeNamesShort[mode]);
 }
 
 static void GL_ChatToRequester(int requesterUserID, const char[] format, any...)
@@ -554,9 +641,9 @@ static int GL_ModeFromIndex(int modeIdx)
 {
 	switch (modeIdx)
 	{
-		case 0: return GOKZ_GetDefaultMode();
-		case 1: return (GOKZ_GetDefaultMode() + 1) % 3;
-		default: return (GOKZ_GetDefaultMode() + 2) % 3;
+		case 0: return gGL_TargetMode;
+		case 1: return (gGL_TargetMode + 1) % 3;
+		default: return (gGL_TargetMode + 2) % 3;
 	}
 }
 
@@ -658,7 +745,8 @@ static void ExtractJsonStringValue(const char[] json, const char[] key, char[] o
 	out[len] = '\0';
 }
 
-// 从 meta JSON 中提取整数值：{"time_ms":12345, ...}
+// 从 meta JSON 中提取整数值：兼容 {"time_ms":12345} 和 {"time_ms":"12345"}
+// 值为 null 或不存在时返回 0
 static int ExtractJsonIntValue(const char[] json, const char[] key)
 {
 	char pattern[64];
@@ -670,8 +758,26 @@ static int ExtractJsonIntValue(const char[] json, const char[] key)
 	}
 	pos += strlen(pattern);
 
+	// 跳过空白
+	while (json[pos] == ' ' || json[pos] == '\t')
+	{
+		pos++;
+	}
+
+	// null → 0（严格匹配：null 后跟逗号或右花括号）
+	if (json[pos] == 'n' && json[pos + 1] == 'u' && json[pos + 2] == 'l' && json[pos + 3] == 'l')
+	{
+		return 0;
+	}
+
+	// 跳过可选的开头引号（字符串数字）
+	if (json[pos] == '"')
+	{
+		pos++;
+	}
+
 	int start = pos;
-	while (json[pos] != '\0' && json[pos] != ',' && json[pos] != '}')
+	while (json[pos] != '\0' && json[pos] != ',' && json[pos] != '}' && json[pos] != '"')
 	{
 		pos++;
 	}

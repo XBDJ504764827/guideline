@@ -176,8 +176,9 @@ map  = 服务器当前地图（小写 URLEncode）
 | gokz_guideline_beam_width | 0.25 | 与 JumpBeam 一致 |
 | gokz_guideline_refresh_interval | 2.0 | 重发间隔（< lifetime） |
 | gokz_guideline_smooth / smooth_points | 1 / 1 | Chaikin 平滑 |
-| gokz_guideline_sample_dist | 32.0 | 降采样距离 |
-| gokz_guideline_break_dist | 1000.0 | 断点判定 |
+| gokz_guideline_sample_dist | 32.0 | 降采样距离（3D）|
+| gokz_guideline_break_dist | 1000.0 | 断点判定（3D 距离）|
+| gokz_guideline_vertical_break_dist | 300.0 | 双层断点（水平 <64 且垂直 >300 断开）|
 
 ---
 
