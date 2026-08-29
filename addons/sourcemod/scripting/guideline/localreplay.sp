@@ -38,8 +38,9 @@ enum struct LocalReplayEntry
 // =====[ PUBLIC ]=====
 
 // 扫描当前地图 data/gokz-replays/_runs/<map>/ 中 course 0 的 RUN 录像，
-// 返回成绩最快的一条（time 最小）。无任何录像时返回 valid=false。
-bool GL_FindFastestLocalReplay(char[] pathOutput, int maxlength, float &bestTime)
+// 只选择指定模式的录像，返回成绩最快的一条（time 最小）。
+// 无该模式录像时返回 false（绝不混用其他模式）。
+bool GL_FindFastestLocalReplay(char[] pathOutput, int maxlength, float &bestTime, int targetMode = -1)
 {
 	pathOutput[0] = '\0';
 	bestTime = 0.0;
@@ -82,6 +83,17 @@ bool GL_FindFastestLocalReplay(char[] pathOutput, int maxlength, float &bestTime
 			continue;
 		}
 
+		// 模式隔离：只选目标模式的录像
+		if (targetMode >= 0 && targetMode <= 2)
+		{
+			char wantMode[8];
+			GL_GetModeShortName(targetMode, wantMode, sizeof(wantMode));
+			if (!StrEqual(modeShort, wantMode, false))
+			{
+				continue;
+			}
+		}
+
 		BuildPath(Path_SM, fullPath, sizeof(fullPath), "%s/%s", GL_REPLAY_DIRECTORY, gC_MapName);
 		Format(fullPath, sizeof(fullPath), "%s/%s", fullPath, fileName);
 
@@ -103,7 +115,7 @@ bool GL_FindFastestLocalReplay(char[] pathOutput, int maxlength, float &bestTime
 
 	if (bestFound <= 0.0)
 	{
-		GL_LogDebug("No valid local replay found for %s", gC_MapName);
+		GL_LogDebug("No valid local replay found for %s mode %d", gC_MapName, targetMode);
 		return false;
 	}
 

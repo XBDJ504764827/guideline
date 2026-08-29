@@ -49,9 +49,8 @@ enum struct Route
 
 // 按模式存储路线（0=VNL, 1=SKZ, 2=KZT），每条路线的 ArrayList 由 Route 结构持有
 Route gGL_Routes[3];
-int gGL_PendingSource; // 解析完成时的来源标记（http.sp 设置，replayfile 完成时读取）
-int gGL_PendingMode;   // 解析完成时的目标模式（http.sp 设置）
 int gGL_BuildMode;     // 当前正在构建/渲染的模式（默认 GOKZ 默认模式）
+int gGL_RequestId;     // 全局请求 ID（异步回调过期校验；http.sp 递增，routes/replayfile 校验）
 
 
 
@@ -152,17 +151,6 @@ bool GL_GetCurrentRouteTime(float &time, int mode = -1)
 	return true;
 }
 
-// 设置解析完成时的来源/模式标记（http.sp 在调用 GL_StartParsing 前设置）
-void GL_SetPendingSource(int source)
-{
-	gGL_PendingSource = source;
-}
-
-void GL_SetPendingMode(int mode)
-{
-	gGL_PendingMode = mode;
-}
-
 // 构建 R2/本地缓存路径：data/gokz-guideline/<map>_<mode>_pro.replay
 void GL_BuildCachePath(char[] buffer, int maxlength, int mode = -1)
 {
@@ -192,13 +180,20 @@ void GL_GetModeShortName(int mode, char[] buffer, int maxlength)
 	}
 }
 
-// 解析完成回调（replayfile.sp 调用）
-void GL_RouteFinishParsed(const char[] playerName, float time, int teleports, int tickrate, ArrayList points)
+// 解析完成回调（replayfile.sp 调用，带完整上下文）
+void GL_RouteFinishParsed(int mode, const char[] playerName, int source, float time, int teleports, int tickrate, ArrayList points, int requestId)
 {
-	int mode = gGL_PendingMode;
 	if (mode < 0 || mode > 2)
 	{
 		mode = gGL_BuildMode;
+	}
+
+	// 过期校验：期间的请求已失效 → 丢弃解析结果，防止覆盖新模式
+	if (requestId != gGL_RequestId)
+	{
+		GL_LogDebug("Stale parse result dropped (mode=%d requestId=%d, current=%d)", mode, requestId, gGL_RequestId);
+		delete points;
+		return;
 	}
 
 	GL_ClearRoute(mode);
@@ -212,14 +207,13 @@ void GL_RouteFinishParsed(const char[] playerName, float time, int teleports, in
 	gGL_Routes[mode].loaded = true;
 	gGL_Routes[mode].parsing = false;
 	gGL_Routes[mode].downloading = false;
-	gGL_Routes[mode].source = gGL_PendingSource;
+	gGL_Routes[mode].source = source;
 
-	// 缓存由渲染层按需重建（GL_RenderRouteToClient 中 gGL_CacheMode != mode 时触发）
+	// 立即为该模式构建线段缓存（渲染直接读取，避免首个渲染 tick 卡顿）
+	GL_RebuildCacheForMode(mode);
 
-	// 来源名（日志用）
-	static const char GL_SourceNames[4][8] = { "none", "cache", "local", "remote" };
-	GL_LogDebug("Route parsed: mode=%d player=\"%s\" time=%.2f teleports=%d points=%d tickrate=%d source=%s",
-		mode, playerName, time, teleports, points.Length, tickrate, GL_SourceNames[gGL_PendingSource]);
+	GL_LogDebug("Route ready: mode=%d player=\"%s\" time=%.2f teleports=%d points=%d tickrate=%d source=%d",
+		mode, playerName, time, teleports, points.Length, tickrate, source);
 }
 
 

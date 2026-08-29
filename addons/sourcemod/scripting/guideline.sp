@@ -128,13 +128,14 @@ public Action GOKZ_RP_OnReplaySaved(int client, int replayType,
 		return Plugin_Continue;
 	}
 
-	// 如果当前路线已加载，且新录像比当前路线更快 → 重新检查
+	// 如果当前路线已加载，且新录像比当前路线更快 → 重新检查（用玩家当前模式）
+	int playerMode = GOKZ_GetCoreOption(client, Option_Mode);
 	float currentTime = 0.0;
-	bool hasRoute = GL_GetCurrentRouteTime(currentTime);
+	bool hasRoute = GL_GetCurrentRouteTime(currentTime, playerMode);
 	if (GL_GetEnabled() && (!hasRoute || time < currentTime))
 	{
-		GL_LogDebug("New faster record saved (%.2fs, was %.2fs) -> recheck route", time, currentTime);
-		GL_CheckRoutes(GL_STRATEGY_AUTO, GetClientUserId(client));
+		GL_LogDebug("New faster record saved (%.2fs, was %.2fs mode=%d) -> recheck route", time, currentTime, playerMode);
+		GL_CheckRoutes(GL_STRATEGY_AUTO, GetClientUserId(client), playerMode);
 	}
 
 	return Plugin_Continue;
