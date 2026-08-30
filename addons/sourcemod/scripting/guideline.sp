@@ -152,14 +152,8 @@ public void OnAllPluginsLoaded()
 		LogError("[guideline] SteamWorks extension not loaded; R2 route downloads are disabled.");
 	}
 
-	// 有玩家在服上的热加载场景：立即为已开启 !gl 的玩家加载路线
-	for (int client = 1; client <= MaxClients; client++)
-	{
-		if (GL_IsValidClient(client) && GL_IsOpen(client))
-		{
-			GL_EnsureRouteForClient(client);
-		}
-	}
+	// 热加载场景：不再自动为已开启 !gl 的玩家加载路线
+	// 新需求为“每图/首入默认关闭，需手动 !gl”，热加载也不应自动开启
 }
 
 // —— from gokz-core ——
