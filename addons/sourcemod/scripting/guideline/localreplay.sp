@@ -125,50 +125,75 @@ bool GL_FindFastestLocalReplay(char[] pathOutput, int maxlength, float &bestTime
 	return true;
 }
 
-// 解析 GOKZ 永久录像文件名：<course>_<MODE>_<STYLE>_<TIMETYPE>.replay
-// 例：0_SKZ_NRM_PRO.replay -> course=0, modeShort="skz", typeStr="pro"
-// 只认 course 0、合法模式（vnl/skz/kzt）；NUB 及未知时间类型一律按 tp。
+// 解析 GOKZ 永久录像文件名（兼容新旧）：
+//  4 段: <course>_<MODE>_<STYLE>_<TIMETYPE>.replay  例: 0_SKZ_NRM_PRO.replay
+//  5 段: <steamId>_<course>_<MODE>_<STYLE>_<TIMETYPE>.replay 例: 0_0_KZT_NRM_NUB.replay / 365313220_0_SKZ_NRM_NUB.replay
+// 只认 course 0、合法模式（vnl/skz/kzt）；PRO=pro 其余按 tp (NUB)。
 bool GL_ParseRunFileName(const char[] fileName, int &course, char[] modeShort, int modeShortLen, char[] typeStr, int typeStrLen)
 {
 	char buf[PLATFORM_MAX_PATH];
 	strcopy(buf, sizeof(buf), fileName);
-
-	// 去掉扩展名
 	int dot = StrContains(buf, ".replay");
 	if (dot == -1)
 	{
 		return false;
 	}
 	buf[dot] = '\0';
-
-	// 按 '_' 切 4 段
-	char parts[4][16];
+	char parts[5][16];
 	int n = ExplodeString(buf, "_", parts, sizeof(parts), sizeof(parts[]));
-	if (n < 4)
+	if (n == 5)
 	{
-		return false;
+		course = StringToInt(parts[1]);
+		if (course != 0) return false;
+		strcopy(modeShort, modeShortLen, parts[2]);
+		GL_ToLower(modeShort, modeShortLen);
+		if (!StrEqual(modeShort, "vnl") && !StrEqual(modeShort, "skz") && !StrEqual(modeShort, "kzt")) return false;
+		if (StrEqual(parts[4], "PRO", false)) strcopy(typeStr, typeStrLen, "pro");
+		else strcopy(typeStr, typeStrLen, "tp");
+		return true;
 	}
-
+	if (n < 4) return false;
 	course = StringToInt(parts[0]);
-	if (course != 0)
-	{
-		return false; // 只处理主图
-	}
-
+	if (course != 0) return false;
 	strcopy(modeShort, modeShortLen, parts[1]);
 	GL_ToLower(modeShort, modeShortLen);
-	if (!StrEqual(modeShort, "vnl") && !StrEqual(modeShort, "skz") && !StrEqual(modeShort, "kzt"))
-	{
-		return false;
-	}
+	if (!StrEqual(modeShort, "vnl") && !StrEqual(modeShort, "skz") && !StrEqual(modeShort, "kzt")) return false;
+	if (StrEqual(parts[3], "PRO", false)) strcopy(typeStr, typeStrLen, "pro");
+	else strcopy(typeStr, typeStrLen, "tp");
+	return true;
+}
 
-	if (StrEqual(parts[3], "PRO", false))
+// 完整解析（5 段新结构）：返回 steamId/course/mode/style/type，用于兼容校验/日志
+#pragma unused GL_ParseRunFileNameFull
+bool GL_ParseRunFileNameFull(const char[] fileName, char[] steamId, int steamIdLen, int &course, char[] modeShort, int modeShortLen, char[] style, int styleLen, char[] typeStr, int typeStrLen)
+{
+	char buf[PLATFORM_MAX_PATH];
+	strcopy(buf, sizeof(buf), fileName);
+	int dot = StrContains(buf, ".replay");
+	if (dot == -1) return false;
+	buf[dot] = '\0';
+	char parts[5][16];
+	int n = ExplodeString(buf, "_", parts, sizeof(parts), sizeof(parts[]));
+	if (n == 5)
 	{
-		strcopy(typeStr, typeStrLen, "pro");
+		strcopy(steamId, steamIdLen, parts[0]);
+		course = StringToInt(parts[1]);
+		if (course != 0) return false;
+		strcopy(modeShort, modeShortLen, parts[2]); GL_ToLower(modeShort, modeShortLen);
+		if (!StrEqual(modeShort, "vnl") && !StrEqual(modeShort, "skz") && !StrEqual(modeShort, "kzt")) return false;
+		strcopy(style, styleLen, parts[3]); GL_ToLower(style, styleLen);
+		if (StrEqual(parts[4], "PRO", false)) strcopy(typeStr, typeStrLen, "pro");
+		else strcopy(typeStr, typeStrLen, "tp");
+		return true;
 	}
-	else
-	{
-		strcopy(typeStr, typeStrLen, "tp");
-	}
+	if (n < 4) return false;
+	strcopy(steamId, steamIdLen, "0");
+	course = StringToInt(parts[0]);
+	if (course != 0) return false;
+	strcopy(modeShort, modeShortLen, parts[1]); GL_ToLower(modeShort, modeShortLen);
+	if (!StrEqual(modeShort, "vnl") && !StrEqual(modeShort, "skz") && !StrEqual(modeShort, "kzt")) return false;
+	strcopy(style, styleLen, parts[2]); GL_ToLower(style, styleLen);
+	if (StrEqual(parts[3], "PRO", false)) strcopy(typeStr, typeStrLen, "pro");
+	else strcopy(typeStr, typeStrLen, "tp");
 	return true;
 }

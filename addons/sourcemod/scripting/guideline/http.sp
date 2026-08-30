@@ -7,12 +7,14 @@
 	阶段 2（body）：sha256 与本地缓存不一致（或无缓存）时才 GET 完整录像，
 	                写入磁盘缓存后交给 replayfile.sp 分帧解析。
 
-	路径约定（与 stratosphere 完全对齐）：
-	  {base}/wr/{mode}/{map}/{type}.replay
+	路径约定（与 stratosphere 完全对齐，新结构 5 段）：
+	  {base}/wr/{map}/{steamId}_{course}_{mode}_{style}_{type}.replay
+	  例: {base}/wr/kz_bhop_easy/0_0_KZT_NRM_PRO.replay
+	      {base}/wr/kz_bhop_easy/365313220_0_SKZ_NRM_NUB.replay
 	- base ：gokz_guideline_url（R2 基础 URL，域名 + 可选前缀）
-	- mode ：请求的 GOKZ 模式（vnl/skz/kzt），优先请求玩家当前模式
 	- map  ：服务器当前地图（小写，URLEncode）
-	- type ：pro / tp（优先 pro；meta 404 后回退 tp）
+	- 文件名：steamId(默认0) + course(0) + 模式(KZT/SKZ/VNL大写) + 风格(NRM) + 类型(PRO/NUB)
+	          类型 PRO=无TP, NUB=有TP（旧 tp 映射为 NUB），优先 PRO 404 回退 NUB
 
 	鉴权：gokz_guideline_api_key 非空时携带 X-API-Key 头（与 stratosphere 一致）。
 
@@ -672,7 +674,8 @@ void EnsureCacheDir()
 	}
 }
 
-// 构建 R2 录像 URL：{base}/wr/{mode}/{map}/{type}.replay
+// 构建 R2 录像 URL（新结构 5 段）：{base}/wr/{map}/{steamId}_{course}_{mode}_{style}_{type}.replay
+// guideline 固定 steamId=0, course=0, style=NRM，仅模式/类型可变
 bool GL_BuildURL(char[] url, int maxlength, int mode, int typeIdx)
 {
 	char base[GL_MAX_URL_LENGTH];
@@ -688,12 +691,13 @@ bool GL_BuildURL(char[] url, int maxlength, int mode, int typeIdx)
 	GL_URLEncode(gC_MapName, encodedMap, sizeof(encodedMap));
 
 	char modeStr[8];
-	GL_GetModeURL(mode, modeStr, sizeof(modeStr));
+	GL_GetModeURL(mode, modeStr, sizeof(modeStr)); // KZT/SKZ/VNL 大写
 
 	char typeStr[8];
-	strcopy(typeStr, sizeof(typeStr), typeIdx == 0 ? "pro" : "tp");
+	strcopy(typeStr, sizeof(typeStr), typeIdx == 0 ? "PRO" : "NUB");
 
-	Format(url, maxlength, "%s/wr/%s/%s/%s.replay", base, modeStr, encodedMap, typeStr);
+	// wr/{map}/0_0_{MODE}_NRM_{PRO|NUB}.replay  例: wr/kz_bhop_easy/0_0_KZT_NRM_PRO.replay
+	Format(url, maxlength, "%s/wr/%s/0_0_%s_NRM_%s.replay", base, encodedMap, modeStr, typeStr);
 	return true;
 }
 
@@ -701,9 +705,9 @@ static void GL_GetModeURL(int mode, char[] buffer, int maxlength)
 {
 	switch (mode)
 	{
-		case 0: strcopy(buffer, maxlength, "vnl");
-		case 1: strcopy(buffer, maxlength, "skz");
-		default: strcopy(buffer, maxlength, "kzt");
+		case 0: strcopy(buffer, maxlength, "VNL");
+		case 1: strcopy(buffer, maxlength, "SKZ");
+		default: strcopy(buffer, maxlength, "KZT");
 	}
 }
 

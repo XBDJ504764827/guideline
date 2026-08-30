@@ -47,7 +47,7 @@ void GL_CreateConVars()
 	gCV_Enabled = AutoExecConfig_CreateConVar("gokz_guideline_enabled", "1",
 		"总开关：是否启用 guideline 路线显示功能（关闭后 !gl 无效）。", _, true, 0.0, true, 1.0);
 	gCV_URL = AutoExecConfig_CreateConVar("gokz_guideline_url", "https://cngokzreplay.iquankz.cn",
-		"R2 存储基础 URL（域名 + 可选前缀，不含路径参数），插件自动拼接 /wr/<模式>/<地图>/<pro|tp>.replay。");
+		"R2 存储基础 URL（域名 + 可选前缀，不含路径参数），插件自动拼接 /wr/<地图>/0_0_<KZT|SKZ|VNL>_NRM_<PRO|NUB>.replay（5段新结构）。");
 	gCV_APIKey = AutoExecConfig_CreateConVar("gokz_guideline_api_key", "",
 		"R2 鉴权密钥（与 stratosphere 上传 Worker 约定的 X-API-Key）。", FCVAR_PROTECTED);
 	gCV_AutoCheck = AutoExecConfig_CreateConVar("gokz_guideline_auto_check", "1",
