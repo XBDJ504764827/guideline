@@ -11,8 +11,10 @@
 	  3. R2 存储（https://cngokzreplay.iquankz.cn，配合 stratosphere 生产端）
 	检查时机：地图加载时自动检查 + !routerefresh 手动强制刷新。
 
-	【键名约定（与 stratosphere 完全对齐）】
-	  R2:  {base}/wr/<vnl|skz|kzt>/<地图名>/<pro|tp>.replay
+	【键名约定（与 stratosphere 完全对齐，新结构 5 段）】
+	  R2:  {base}/wr/<地图名>/0_0_<KZT|SKZ|VNL>_NRM_<PRO|NUB>.replay
+	       例: {base}/wr/kz_bhop_easy/0_0_KZT_NRM_PRO.replay
+	           {base}/wr/kz_bhop_easy/365313220_0_SKZ_NRM_NUB.replay
 	  本地: data/gokz-replays/_runs/<地图名>/<course>_<MODE>_<STYLE>_<TIMETYPE>.replay
 	  - 只处理 course 0（主图）；B1/B2 忽略
 	  - 传送点（flags bit 22）跳过不连线，避免线条穿地图
@@ -25,11 +27,12 @@
 	  - 颜色：紫色（默认 148 0 211 110，可配置）
 	  - 拐角：Chaikin 角切割平滑（默认 1 次迭代），形成与 JumpBeam 一致的自然圆弧
 
-	【Worker 协议（与 stratosphere 一致）】
-	  GET {url}/wr/{mode}/{map}/{type}.replay?meta=1
+	【Worker 协议（与 stratosphere 一致，新结构 5 段）】
+	  GET {url}/wr/{map}/0_0_{MODE}_NRM_{TYPE}.replay?meta=1
+	    例: {url}/wr/kz_bhop_easy/0_0_KZT_NRM_PRO.replay?meta=1
 	    Headers: X-API-Key: <gokz_guideline_api_key>
 	    响应 JSON: { exists, time_ms, sha256, size }
-	  GET {url}/wr/{mode}/{map}/{type}.replay   → 录像二进制
+	  GET {url}/wr/{map}/0_0_{MODE}_NRM_{TYPE}.replay   → 录像二进制
 
 	依赖：SourceMod 1.11、SteamWorks 扩展（无则禁用 R2 下载）、gokz-core、
 	      gokz-replays（仅要求本地 _runs 目录格式；不依赖其 API）。
