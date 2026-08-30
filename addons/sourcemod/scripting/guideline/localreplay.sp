@@ -164,6 +164,7 @@ bool GL_ParseRunFileName(const char[] fileName, int &course, char[] modeShort, i
 }
 
 // 完整解析（5 段新结构）：返回 steamId/course/mode/style/type，用于兼容校验/日志
+#pragma unused GL_ParseRunFileNameFull
 bool GL_ParseRunFileNameFull(const char[] fileName, char[] steamId, int steamIdLen, int &course, char[] modeShort, int modeShortLen, char[] style, int styleLen, char[] typeStr, int typeStrLen)
 {
 	char buf[PLATFORM_MAX_PATH];
