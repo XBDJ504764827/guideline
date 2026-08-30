@@ -181,9 +181,37 @@ static bool SkipString(File file)
 
 
 
-// =====[ PARSE (ASYNC) ]=====
+// =====[ PARSE STATE ]=====
 
-// 开始解析：读 header（同步）→ 分帧解析 tick 数据（定时器）
+// 解析任务上下文（显式绑定，不依赖全局 pending 变量）
+int gGL_ParseContextMode;   // 目标模式
+int gGL_ParseContextSource; // 来源（GL_SOURCE_*）
+int gGL_ParseContextRequestId; // 请求 ID（解析完成后校验有效性）
+bool gGL_ParseContextValid;
+
+
+
+// =====[ PUBLIC ]=====
+
+// 开始解析（带完整上下文）：读 header（同步）→ 分帧解析 tick 数据（定时器）
+// 解析结果显式写入 mode/source/requestId，完成后校验 requestId 防过期覆盖
+void GL_StartParsingWithContext(const char[] path, int course, int mode, int requesterUserID, int source, int requestId)
+{
+	if (gGL_File != null)
+	{
+		GL_LogDebug("Parse already in progress, skip: %s", path);
+		return;
+	}
+
+	gGL_ParseContextMode = mode;
+	gGL_ParseContextSource = source;
+	gGL_ParseContextRequestId = requestId;
+	gGL_ParseContextValid = true;
+
+	GL_StartParsing(path, course, mode, requesterUserID);
+}
+
+// 开始解析（基础版）：读 header（同步）→ 分帧解析 tick 数据（定时器）
 void GL_StartParsing(const char[] path, int course, int mode, int requesterUserID)
 {
 	if (gGL_File != null)
@@ -303,13 +331,17 @@ static void FinishParsing()
 {
 	GL_LogDebug("Parse done: %d ticks, %d raw points", gGL_ParseTickCount, gGL_ParseRaw.Length);
 
+	// 使用解析上下文（显式绑定，不依赖全局 pending）
+	int parseMode = gGL_ParseContextValid ? gGL_ParseContextMode : gGL_ParseMode;
+	int parseSource = gGL_ParseContextValid ? gGL_ParseContextSource : GL_SOURCE_NONE;
+	int requestId = gGL_ParseContextRequestId;
+
 	// 降采样
 	ArrayList points = GL_Downsample(gGL_ParseRaw);
 	delete gGL_ParseRaw;
 	gGL_ParseRaw = null;
 
 	int course = gGL_ParseCourse;
-	int mode = gGL_ParseMode;
 	int requesterUserID = gGL_ParseRequesterUserID;
 	char player[32];
 	strcopy(player, sizeof(player), gGL_ParsePlayer);
@@ -319,12 +351,12 @@ static void FinishParsing()
 
 	CleanupStream();
 
-	GL_LogDebug("Parse finished: course=%d mode=%d", course, mode);
-	GL_RouteFinishParsed(player, time, teleports, tickrate, points);
+	GL_LogDebug("Parse finished: course=%d mode=%d", course, parseMode);
+	GL_RouteFinishParsed(parseMode, player, parseSource, time, teleports, tickrate, points, requestId);
 
-	// 通知请求者
+	// 通知请求者（仅当请求仍有效）
 	int requester = GetClientOfUserId(requesterUserID);
-	if (requester != 0 && GL_IsValidClient(requester))
+	if (requester != 0 && GL_IsValidClient(requester) && GL_IsRequestValid(requestId))
 	{
 		if (points.Length >= 2)
 		{

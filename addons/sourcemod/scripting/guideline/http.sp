@@ -41,6 +41,11 @@
 
 bool gGL_MetaBusy; // 防重入：同一时间只允许一个 meta 查询流程
 int gGL_TargetMode; // 本次请求的目标模式（0=VNL 1=SKZ 2=KZT）
+// 等待队列：busy 期间的新请求暂存，busy 释放后自动重试（修复并发 skip 导致永久 busy）
+bool gGL_MetaPending;
+int gGL_MetaPendingStrategy;
+int gGL_MetaPendingRequester;
+int gGL_MetaPendingMode;
 
 enum
 {
@@ -56,6 +61,20 @@ enum
 // 检查并加载指定模式的路线（自动/手动统一入口）
 // 优先本地录像 → 否则走 meta+缓存 → 最后回退下载 R2
 // mode < 0 时使用玩家当前模式（requesterUserID > 0）或服务器默认模式
+void GL_TryFlushPending()
+{
+	if (!gGL_MetaPending || gGL_MetaBusy)
+	{
+		return;
+	}
+	int strategy = gGL_MetaPendingStrategy;
+	int requester = gGL_MetaPendingRequester;
+	int mode = gGL_MetaPendingMode;
+	gGL_MetaPending = false;
+	GL_LogDebug("Flushing pending request mode=%d strategy=%d", mode, strategy);
+	GL_CheckRoutes(strategy, requester, mode);
+}
+
 void GL_CheckRoutes(int strategy, int requesterUserID = 0, int mode = -1)
 {
 	// 确定目标模式
@@ -71,13 +90,24 @@ void GL_CheckRoutes(int strategy, int requesterUserID = 0, int mode = -1)
 			mode = GOKZ_GetDefaultMode();
 		}
 	}
+	// 若管线正忙则排队，待当前 meta/download 完成后再重试（避免 increment 后 stale 导致永久 busy）
+	if (gGL_MetaBusy)
+	{
+		gGL_MetaPending = true;
+		gGL_MetaPendingStrategy = strategy;
+		gGL_MetaPendingRequester = requesterUserID;
+		gGL_MetaPendingMode = mode;
+		GL_LogDebug("Meta pipeline busy, queued pending mode=%d strategy=%d (current target=%d)", mode, strategy, gGL_TargetMode);
+		return;
+	}
 	gGL_TargetMode = mode;
+	gGL_RequestId++; // 新请求产生新 ID，旧异步回调将被丢弃
 
 	// 无 SteamWorks 时仍可用本地录像（只跳过 R2 阶段）
 	if (!gB_SteamWorksOK)
 	{
 		GL_LogError("CheckRoutes: SteamWorks not available, using local replay only");
-		FinishWithLocalOrCache(requesterUserID, mode);
+		FinishWithLocalOrCache(requesterUserID, mode, gGL_RequestId);
 		return;
 	}
 
@@ -96,8 +126,8 @@ void GL_CheckRoutes(int strategy, int requesterUserID = 0, int mode = -1)
 	}
 
 	// 记录请求场景（自动/手动/按需），供调试使用
-	GL_LogDebug("CheckRoutes: strategy=%d requester=%d mode=%d", strategy, requesterUserID, mode);
-	GL_MetaStart(requesterUserID, 0); // modeIdx=0 = 目标模式
+	GL_LogDebug("CheckRoutes: strategy=%d requester=%d mode=%d requestId=%d", strategy, requesterUserID, mode, gGL_RequestId);
+	GL_MetaStart(requesterUserID, gGL_RequestId); // modeIdx=0 = 目标模式
 }
 
 // 手动刷新（!routerefresh）：清空指定模式路线并重新检查
@@ -161,30 +191,31 @@ void GL_EnsureRouteForClient(int client)
 
 // =====[ META / DOWNLOAD PIPELINE ]=====
 
-static void GL_MetaStart(int requesterUserID, int modeIdx)
+static void GL_MetaStart(int requesterUserID, int requestId)
 {
 	if (gGL_MetaBusy)
 	{
-		GL_LogDebug("Meta pipeline already busy, skip");
+		GL_LogDebug("Meta pipeline already busy, skip (requestId=%d)", requestId);
+		// 已在 GL_CheckRoutes 排队，此处不再重复排队
 		return;
 	}
 	gGL_MetaBusy = true;
 
-	int mode = GL_ModeFromIndex(modeIdx);
+	int mode = GL_ModeFromIndex(0);
 	char modeStr[8];
 	GL_GetModeURL(mode, modeStr, sizeof(modeStr));
 
-	// type 顺序：pro → tp（meta 404 后回退）
-	GL_MetaRequest(modeIdx, 0, requesterUserID); // typeIdx=0 = pro
+	// type 顺序：pro → tp（meta 404 后回退，仅限同模式）
+	GL_MetaRequest(0, 0, requesterUserID, requestId); // typeIdx=0 = pro
 }
 
-static void GL_MetaRequest(int modeIdx, int typeIdx, int requesterUserID)
+static void GL_MetaRequest(int modeIdx, int typeIdx, int requesterUserID, int requestId)
 {
 	int mode = GL_ModeFromIndex(modeIdx);
 	char url[GL_MAX_URL_LENGTH];
 	if (!GL_BuildURL(url, sizeof(url), mode, typeIdx))
 	{
-		GL_MetaFail("URL build failed", requesterUserID);
+		GL_MetaFail("URL build failed", requesterUserID, requestId);
 		return;
 	}
 
@@ -194,7 +225,7 @@ static void GL_MetaRequest(int modeIdx, int typeIdx, int requesterUserID)
 	Handle hRequest = SteamWorks_CreateHTTPRequest(k_EHTTPMethodGET, metaUrl);
 	if (hRequest == null)
 	{
-		GL_MetaFail("Failed to create meta request", requesterUserID);
+		GL_MetaFail("Failed to create meta request", requesterUserID, requestId);
 		return;
 	}
 
@@ -212,16 +243,17 @@ static void GL_MetaRequest(int modeIdx, int typeIdx, int requesterUserID)
 	pack.WriteCell(modeIdx);
 	pack.WriteCell(typeIdx);
 	pack.WriteCell(requesterUserID);
+	pack.WriteCell(requestId);
 	SteamWorks_SetHTTPRequestContextValue(hRequest, pack);
 	SteamWorks_SetHTTPCallbacks(hRequest, OnMetaComplete);
 
-	GL_LogDebug("Meta request: %s", metaUrl);
+	GL_LogDebug("Meta request: %s (requestId=%d)", metaUrl, requestId);
 
 	if (!SteamWorks_SendHTTPRequest(hRequest))
 	{
 		delete pack;
 		delete hRequest;
-		GL_MetaFail("Failed to send meta request", requesterUserID);
+		GL_MetaFail("Failed to send meta request", requesterUserID, requestId);
 	}
 }
 
@@ -238,42 +270,52 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 	int modeIdx = pack.ReadCell();
 	int typeIdx = pack.ReadCell();
 	int requesterUserID = pack.ReadCell();
+	int requestId = pack.ReadCell();
 	delete pack;
+
+	// 过期校验：期间发起了新请求（如玩家快速切模式）→ 丢弃旧回调结果并释放管线
+	if (requestId != gGL_RequestId)
+	{
+		GL_LogDebug("Stale meta callback dropped (requestId=%d, current=%d)", requestId, gGL_RequestId);
+		delete hRequest;
+		// 旧请求已过期，释放 busy 并尝试 pending（若有排队）
+		if (gGL_MetaBusy)
+		{
+			gGL_MetaBusy = false;
+			GL_TryFlushPending();
+		}
+		return;
+	}
 
 	int mode = GL_ModeFromIndex(modeIdx);
 
-	// 404 = 该组合无录像 → 回退下一个组合（tp 格式 / 下一个模式）
+	// 404 = 该组合无录像 → 仅同模式回退 tp（禁止跨模式回退！）
 	if (!bFailure && bRequestSuccessful && eStatusCode == k_EHTTPStatusCode404NotFound)
 	{
 		GL_LogDebug("Meta 404: mode=%d type=%d", mode, typeIdx);
-		// 先试 tp；再试下一个模式（最多 3 个模式 × 2 个类型 = 6 次）
 		if (typeIdx == 0)
 		{
-			GL_MetaRequest(modeIdx, 1, requesterUserID);
+			GL_MetaRequest(modeIdx, 1, requesterUserID, requestId); // 仅回退 tp
 			delete hRequest;
 			return;
 		}
-		if (modeIdx + 1 < GL_MODE_COUNT)
-		{
-			GL_MetaRequest(modeIdx + 1, 0, requesterUserID);
-			delete hRequest;
-			return;
-		}
-		// 全部 404：只保留本地录像（若存在）
-		GL_LogDebug("Meta all-404 for %s; falling back to local replay", gC_MapName);
+		// 同模式 pro+tp 均 404 → 该模式无录像，直接本地/缓存兜底
+		GL_LogDebug("Meta all-404 for mode %d; falling back to local replay", mode);
 		gGL_MetaBusy = false;
-		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode, requestId);
+		GL_TryFlushPending();
 		delete hRequest;
 		return;
 	}
 
-	// 其它失败（Worker 不可达等）→ 回退本地/缓存
+	// 其它失败（Worker 不可达等）→ 回退本地/缓存（同模式）
 	if (bFailure || !bRequestSuccessful || eStatusCode != k_EHTTPStatusCode200OK)
 	{
 		gGL_MetaBusy = false;
 		GL_LogError("Meta request failed: mode=%d type=%d failure=%d successful=%d status=%d",
 			mode, typeIdx, bFailure ? 1 : 0, bRequestSuccessful ? 1 : 0, view_as<int>(eStatusCode));
-		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode, requestId);
+		GL_TryFlushPending();
 		delete hRequest;
 		return;
 	}
@@ -284,7 +326,8 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 	if (bodySize <= 0 || bodySize > 4096)
 	{
 		gGL_MetaBusy = false;
-		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode, requestId);
+		GL_TryFlushPending();
 		delete hRequest;
 		return;
 	}
@@ -301,17 +344,16 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 	GL_LogDebug("Meta OK: mode=%d type=%d time_ms=%d sha=%.12s", mode, typeIdx, remoteTimeMs, remoteSha);
 
 	// ===== 三方对比（针对目标模式） =====
-	// 本地录像 / 该模式缓存 / 该模式 R2，取最小 time
 	int targetMode = gGL_TargetMode;
 	char localPath[PLATFORM_MAX_PATH];
 	float localTime = 0.0;
-	bool hasLocal = GL_FindFastestLocalReplay(localPath, sizeof(localPath), localTime);
+	// 本地录像只选目标模式（禁止跨模式混用）
+	bool hasLocal = GL_FindFastestLocalReplay(localPath, sizeof(localPath), localTime, targetMode);
 
 	float cacheTime = 0.0;
 	bool hasCache = GL_GetCurrentRouteTime(cacheTime, targetMode);
 
 	// 选最优来源
-	// 优先级：R2 > 缓存 > 本地（time 小者胜）
 	float bestTime = 0.0;
 	int bestSource = GL_SOURCE_NONE; // 见 routes.sp
 	char bestPath[PLATFORM_MAX_PATH];
@@ -355,9 +397,8 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 		{
 			gGL_MetaBusy = false;
 			GL_LogDebug("Remote has no time_ms but sha matches cache; using cache");
-			GL_SetPendingSource(GL_SOURCE_CACHE);
-			GL_SetPendingMode(targetMode);
-			GL_StartParsing(cachePath3, 0, mode, requesterUserID);
+			GL_StartParsingWithContext(cachePath3, 0, targetMode, requesterUserID, GL_SOURCE_CACHE, requestId);
+			GL_TryFlushPending();
 			return;
 		}
 
@@ -366,11 +407,12 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 		if (!GL_BuildURL(url, sizeof(url), mode, typeIdx))
 		{
 			gGL_MetaBusy = false;
-			FinishWithLocalOrCache(requesterUserID, targetMode);
+			FinishWithLocalOrCache(requesterUserID, targetMode, requestId);
+			GL_TryFlushPending();
 			return;
 		}
 		GL_LogDebug("Remote exists but no time info; downloading to inspect");
-		StartDownload(mode, requesterUserID, url);
+		StartDownload(mode, requesterUserID, url, requestId);
 		return;
 	}
 
@@ -390,9 +432,8 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 			{
 				gGL_MetaBusy = false;
 				GL_LogDebug("Cache up-to-date (sha match), using cache");
-				GL_SetPendingSource(GL_SOURCE_CACHE);
-				GL_SetPendingMode(targetMode);
-				GL_StartParsing(cachePath2, 0, mode, requesterUserID);
+				GL_StartParsingWithContext(cachePath2, 0, targetMode, requesterUserID, GL_SOURCE_CACHE, requestId);
+				GL_TryFlushPending();
 				return;
 			}
 		}
@@ -402,10 +443,11 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 		if (!GL_BuildURL(url, sizeof(url), mode, typeIdx))
 		{
 			gGL_MetaBusy = false;
-			FinishWithLocalOrCache(requesterUserID, targetMode);
+			FinishWithLocalOrCache(requesterUserID, targetMode, requestId);
+			GL_TryFlushPending();
 			return;
 		}
-		StartDownload(mode, requesterUserID, url);
+		StartDownload(mode, requesterUserID, url, requestId);
 		return;
 	}
 
@@ -413,24 +455,27 @@ public void OnMetaComplete(Handle hRequest, bool bFailure, bool bRequestSuccessf
 	gGL_MetaBusy = false;
 	if (bestSource == GL_SOURCE_LOCAL)
 	{
-		GL_SetPendingSource(GL_SOURCE_LOCAL);
-		GL_SetPendingMode(targetMode);
-		GL_ChatToRequester(requesterUserID, "{lime}使用本服最快录像（{default}%.2f 秒{lime}）。", bestTime);
-		GL_StartParsing(bestPath, 0, mode, requesterUserID);
+		GL_ChatToRequester(requesterUserID, "{lime}使用本服 {default}%s{lime} 模式最快录像（{default}%.2f 秒{lime}）。", gC_ModeNamesShort[targetMode], bestTime);
+		GL_StartParsingWithContext(bestPath, 0, targetMode, requesterUserID, GL_SOURCE_LOCAL, requestId);
 	}
 	else if (bestSource == GL_SOURCE_CACHE)
 	{
-		GL_SetPendingSource(GL_SOURCE_CACHE);
-		GL_SetPendingMode(targetMode);
-		GL_ChatToRequester(requesterUserID, "{grey}使用缓存录像（{default}%.2f 秒{grey}）。", bestTime);
+		GL_ChatToRequester(requesterUserID, "{grey}使用 {default}%s{grey} 模式缓存录像（{default}%.2f 秒{grey}）。", gC_ModeNamesShort[targetMode], bestTime);
 		char cachePath[PLATFORM_MAX_PATH];
 		GL_BuildCachePath(cachePath, sizeof(cachePath), targetMode);
-		GL_StartParsing(cachePath, 0, mode, requesterUserID);
+		GL_StartParsingWithContext(cachePath, 0, targetMode, requesterUserID, GL_SOURCE_CACHE, requestId);
 	}
 	else
 	{
-		FinishWithLocalOrCache(requesterUserID, targetMode);
+		FinishWithLocalOrCache(requesterUserID, targetMode, requestId);
 	}
+	GL_TryFlushPending();
+}
+
+// 过期校验助手：请求是否仍有效
+bool GL_IsRequestValid(int requestId)
+{
+	return requestId == gGL_RequestId;
 }
 
 public void OnDownloadComplete(Handle hRequest, bool bFailure, bool bRequestSuccessful, EHTTPStatusCode eStatusCode, any data1)
@@ -445,14 +490,29 @@ public void OnDownloadComplete(Handle hRequest, bool bFailure, bool bRequestSucc
 	pack.Reset();
 	int mode = pack.ReadCell();
 	int requesterUserID = pack.ReadCell();
+	int requestId = pack.ReadCell();
 	delete pack;
+
+	// 过期校验：期间发起了新请求 → 丢弃旧下载结果并释放管线
+	if (requestId != gGL_RequestId)
+	{
+		GL_LogDebug("Stale download callback dropped (mode=%d requestId=%d, current=%d)", mode, requestId, gGL_RequestId);
+		delete hRequest;
+		if (gGL_MetaBusy)
+		{
+			gGL_MetaBusy = false;
+			GL_TryFlushPending();
+		}
+		return;
+	}
 
 	if (bFailure || !bRequestSuccessful || eStatusCode != k_EHTTPStatusCode200OK)
 	{
 		gGL_MetaBusy = false;
 		GL_LogError("Download failed: failure=%d successful=%d status=%d",
 			bFailure ? 1 : 0, bRequestSuccessful ? 1 : 0, view_as<int>(eStatusCode));
-		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode, requestId);
+		GL_TryFlushPending();
 		delete hRequest;
 		return;
 	}
@@ -463,7 +523,8 @@ public void OnDownloadComplete(Handle hRequest, bool bFailure, bool bRequestSucc
 	{
 		gGL_MetaBusy = false;
 		GL_LogError("Downloaded body size out of range (%d)", bodySize);
-		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode, requestId);
+		GL_TryFlushPending();
 		delete hRequest;
 		return;
 	}
@@ -476,7 +537,8 @@ public void OnDownloadComplete(Handle hRequest, bool bFailure, bool bRequestSucc
 	{
 		gGL_MetaBusy = false;
 		GL_LogError("Failed to write downloaded replay to disk: %s", path);
-		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode, requestId);
+		GL_TryFlushPending();
 		delete hRequest;
 		return;
 	}
@@ -494,23 +556,23 @@ public void OnDownloadComplete(Handle hRequest, bool bFailure, bool bRequestSucc
 	// 进入分帧解析管线
 	gGL_MetaBusy = false;
 	GL_LogDebug("Download OK: %d bytes (sha=%.12s)", bodySize, sha256);
-	GL_SetPendingSource(GL_SOURCE_REMOTE);
-	GL_SetPendingMode(gGL_TargetMode);
-	GL_StartParsing(path, 0, mode, requesterUserID);
+	GL_StartParsingWithContext(path, 0, gGL_TargetMode, requesterUserID, GL_SOURCE_REMOTE, requestId);
+	GL_TryFlushPending();
 }
 
 
 
 // =====[ PRIVATE ]=====
 
-static void StartDownload(int mode, int requesterUserID, const char[] url)
+static void StartDownload(int mode, int requesterUserID, const char[] url, int requestId)
 {
 	Handle hRequest = SteamWorks_CreateHTTPRequest(k_EHTTPMethodGET, url);
 	if (hRequest == null)
 	{
 		gGL_MetaBusy = false;
 		GL_LogError("Failed to create download request: %s", url);
-		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode, requestId);
+		GL_TryFlushPending();
 		return;
 	}
 
@@ -527,10 +589,11 @@ static void StartDownload(int mode, int requesterUserID, const char[] url)
 	DataPack pack = new DataPack();
 	pack.WriteCell(mode);
 	pack.WriteCell(requesterUserID);
+	pack.WriteCell(requestId);
 	SteamWorks_SetHTTPRequestContextValue(hRequest, pack);
 	SteamWorks_SetHTTPCallbacks(hRequest, OnDownloadComplete);
 
-	GL_LogDebug("Download: %s", url);
+	GL_LogDebug("Download: %s (requestId=%d)", url, requestId);
 
 	if (!SteamWorks_SendHTTPRequest(hRequest))
 	{
@@ -538,30 +601,39 @@ static void StartDownload(int mode, int requesterUserID, const char[] url)
 		delete hRequest;
 		gGL_MetaBusy = false;
 		GL_LogError("Failed to send download request: %s", url);
-		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
+		FinishWithLocalOrCache(requesterUserID, gGL_TargetMode, requestId);
+		GL_TryFlushPending();
 	}
 }
 
 // =====[ PRIVATE ]=====
 
-static void GL_MetaFail(const char[] reason, int requesterUserID)
+static void GL_MetaFail(const char[] reason, int requesterUserID, int requestId)
 {
 	GL_LogError("%s", reason);
 	gGL_MetaBusy = false;
-	FinishWithLocalOrCache(requesterUserID, gGL_TargetMode);
+	FinishWithLocalOrCache(requesterUserID, gGL_TargetMode, requestId);
+	GL_TryFlushPending();
 }
 
 // meta 全部失败/404 时的最终兜底：本地录像 → 该模式缓存 → 无
-static void FinishWithLocalOrCache(int requesterUserID, int mode)
+// 只使用目标模式资源，绝不跨模式回退
+static void FinishWithLocalOrCache(int requesterUserID, int mode, int requestId)
 {
+	// 过期校验：期间发起了新请求 → 丢弃
+	if (requestId != gGL_RequestId)
+	{
+		GL_LogDebug("Stale fallback dropped (requestId=%d)", requestId);
+		return;
+	}
+
 	char localPath[PLATFORM_MAX_PATH];
 	float localTime = 0.0;
-	if (GL_FindFastestLocalReplay(localPath, sizeof(localPath), localTime))
+	// 本地录像只选目标模式
+	if (GL_FindFastestLocalReplay(localPath, sizeof(localPath), localTime, mode))
 	{
-		GL_SetPendingSource(GL_SOURCE_LOCAL);
-		GL_SetPendingMode(mode);
-		GL_ChatToRequester(requesterUserID, "{lime}使用本服最快录像（{default}%.2f 秒{lime}）。", localTime);
-		GL_StartParsing(localPath, 0, mode, requesterUserID);
+		GL_ChatToRequester(requesterUserID, "{lime}使用本服 {default}%s{lime} 模式最快录像（{default}%.2f 秒{lime}）。", gC_ModeNamesShort[mode], localTime);
+		GL_StartParsingWithContext(localPath, 0, mode, requesterUserID, GL_SOURCE_LOCAL, requestId);
 		return;
 	}
 
@@ -569,14 +641,12 @@ static void FinishWithLocalOrCache(int requesterUserID, int mode)
 	GL_BuildCachePath(cachePath, sizeof(cachePath), mode);
 	if (FileExists(cachePath))
 	{
-		GL_SetPendingSource(GL_SOURCE_CACHE);
-		GL_SetPendingMode(mode);
-		GL_ChatToRequester(requesterUserID, "{grey}使用缓存录像。");
-		GL_StartParsing(cachePath, 0, mode, requesterUserID);
+		GL_ChatToRequester(requesterUserID, "{grey}使用 {default}%s{grey} 模式缓存录像。", gC_ModeNamesShort[mode]);
+		GL_StartParsingWithContext(cachePath, 0, mode, requesterUserID, GL_SOURCE_CACHE, requestId);
 		return;
 	}
 
-	GL_ChatToRequester(requesterUserID, "{darkred}未找到本图 %s 模式路线（本地无录像，R2 无录像）。", gC_ModeNamesShort[mode]);
+	GL_ChatToRequester(requesterUserID, "{darkred}未找到本图 {default}%s{darkred} 模式路线（该模式无录像）。", gC_ModeNamesShort[mode]);
 }
 
 static void GL_ChatToRequester(int requesterUserID, const char[] format, any...)

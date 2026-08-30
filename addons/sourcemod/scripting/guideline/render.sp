@@ -19,9 +19,11 @@
 // =====[ STATE ]=====
 
 int gGL_RenderTick; // 渲染节流计数（大路线降频用）
-ArrayList gGL_Segments; // 预计算线段缓存（每项 6 个 float: start[3]+end[3]）
+// 每模式独立线段缓存（VNL/SKZ/KZT 各一份，多玩家不同模式不互相重建）
+ArrayList gGL_Segments[3];
+// 每模式线段中点缓存（预计算，扫描附近段时避免重复计算中点）
+ArrayList gGL_SegmentMids[3]; // 每项 3 float（中点 xyz）
 int gGL_SegmentCursor[MAXPLAYERS + 1]; // 分批渲染游标（每玩家独立，滚动窗口起点）
-int gGL_CacheMode; // 线段缓存所属的模式（0=VNL 1=SKZ 2=KZT）
 // 玩家附近段缓存（性能优化：玩家不动时不重扫）
 float gGL_PlayerLastOrigin[MAXPLAYERS + 1][3];
 bool gGL_PlayerNearValid[MAXPLAYERS + 1];
@@ -139,19 +141,21 @@ void GL_RebuildCacheForMode(int mode)
 	{
 		return;
 	}
-	gGL_CacheMode = mode;
-	GL_BuildSegmentCache(routeInfo.points);
-	GL_LogDebug("Segment cache rebuilt for mode %d (%d segments)", mode, gGL_Segments != null ? gGL_Segments.Length : 0);
+	GL_BuildSegmentCache(mode, routeInfo.points);
+	GL_LogDebug("Segment cache rebuilt for mode %d (%d segments)", mode, gGL_Segments[mode] != null ? gGL_Segments[mode].Length : 0);
 }
 
 // 清空线段缓存（换图/重载时）
 void GL_ClearSegmentCache()
 {
-	if (gGL_Segments != null)
+	for (int mode = 0; mode < 3; mode++)
 	{
-		delete gGL_Segments;
+		if (gGL_Segments[mode] != null)
+		{
+			delete gGL_Segments[mode];
+		}
+		gGL_Segments[mode] = null;
 	}
-	gGL_Segments = null;
 	for (int client = 1; client <= MaxClients; client++)
 	{
 		gGL_SegmentCursor[client] = 0;
@@ -161,9 +165,23 @@ void GL_ClearSegmentCache()
 // 预构建线段缓存：解析完成后调用（routes.sp 的 GL_RouteFinishParsed）
 // 全量 Cheikin 细分后的线段存下来，后续渲染只做轮转发送，
 // 避免每次渲染重复计算 + 一次性发送过多 beam 被丢弃
-void GL_BuildSegmentCache(ArrayList points)
+void GL_BuildSegmentCache(int mode, ArrayList points)
 {
-	GL_ClearSegmentCache();
+	if (mode < 0 || mode > 2)
+	{
+		return;
+	}
+	// 只清空该模式的缓存（不影响其他模式）
+	if (gGL_Segments[mode] != null)
+	{
+		delete gGL_Segments[mode];
+	}
+	gGL_Segments[mode] = null;
+	if (gGL_SegmentMids[mode] != null)
+	{
+		delete gGL_SegmentMids[mode];
+	}
+	gGL_SegmentMids[mode] = null;
 	if (points == null || points.Length < 2)
 	{
 		return;
@@ -188,7 +206,8 @@ void GL_BuildSegmentCache(ArrayList points)
 		totalBeams = (n - 1) * subdiv;
 	}
 
-	gGL_Segments = new ArrayList(6); // 每项 6 float: start[3] + end[3]
+	gGL_Segments[mode] = new ArrayList(6); // 每项 6 float: start[3] + end[3]
+	gGL_SegmentMids[mode] = new ArrayList(3); // 每项 3 float 中点
 
 	// 收集连续点序列（断点处断开），逐段细分后存入缓存
 	ArrayList seq = new ArrayList(3);
@@ -227,7 +246,7 @@ void GL_BuildSegmentCache(ArrayList points)
 
 		if (needFlushBefore)
 		{
-			BuildSegmentsFromSequence(seq, chaikinIter);
+			BuildSegmentsFromSequence(mode, seq, chaikinIter);
 			delete seq;
 			seq = new ArrayList(3);
 		}
@@ -237,14 +256,14 @@ void GL_BuildSegmentCache(ArrayList points)
 		seq.PushArray(tp.origin);
 	}
 	// 收尾
-	BuildSegmentsFromSequence(seq, chaikinIter);
+	BuildSegmentsFromSequence(mode, seq, chaikinIter);
 	delete seq;
 
-	GL_LogDebug("Segment cache built: %d segments", gGL_Segments.Length);
+	GL_LogDebug("Segment cache built (mode %d): %d segments", mode, gGL_Segments[mode].Length);
 }
 
 // 对点序列做 Chaikin 细分并把所有线段写入缓存
-static void BuildSegmentsFromSequence(ArrayList seq, int iter)
+static void BuildSegmentsFromSequence(int mode, ArrayList seq, int iter)
 {
 	if (seq.Length < 2)
 	{
@@ -295,7 +314,13 @@ static void BuildSegmentsFromSequence(ArrayList seq, int iter)
 		float seg[6];
 		seg[0] = a[0]; seg[1] = a[1]; seg[2] = a[2];
 		seg[3] = b[0]; seg[4] = b[1]; seg[5] = b[2];
-		gGL_Segments.PushArray(seg);
+		gGL_Segments[mode].PushArray(seg);
+		// 同步预计算中点（3 float）
+		float mid[3];
+		mid[0] = (a[0] + b[0]) * 0.5;
+		mid[1] = (a[1] + b[1]) * 0.5;
+		mid[2] = (a[2] + b[2]) * 0.5;
+		gGL_SegmentMids[mode].PushArray(mid);
 	}
 
 	delete cur;
@@ -313,18 +338,18 @@ void GL_RenderRouteToClient(int client)
 		return; // 该模式无路线（渲染由 EnsureRoute 触发加载）
 	}
 
-	// 线段缓存尚未为该模式构建则重建
-	if (gGL_Segments == null || gGL_Segments.Length < 2 || gGL_CacheMode != mode)
+	// 该模式线段缓存尚未构建则重建
+	if (gGL_Segments[mode] == null || gGL_Segments[mode].Length < 2)
 	{
 		GL_RebuildCacheForMode(mode);
 	}
 
-	if (gGL_Segments == null || gGL_Segments.Length < 2)
+	if (gGL_Segments[mode] == null || gGL_Segments[mode].Length < 2)
 	{
 		return;
 	}
 
-	int totalSegments = gGL_Segments.Length; // 每项 6 cells = 1 段
+	int totalSegments = gGL_Segments[mode].Length; // 每项 6 cells = 1 段
 	int color[4];
 	GL_GetColor(color);
 	float life = GL_GetBeamLifetime();
@@ -379,20 +404,22 @@ void GL_RenderRouteToClient(int client)
 			float[] nearDist = new float[maxNearScan];
 			int nearCount = 0;
 
+			// 平方距离（避免开平方）；限制平方阈值
 			float nearDistLimit = GL_GetNearDist();
+			float nearDistLimitSq = nearDistLimit * nearDistLimit;
 			for (int s = 0; s < maxNearScan; s++)
 			{
-				float seg[6];
-				gGL_Segments.GetArray(s, seg);
+				// 使用预计算中点（无需重新计算线段中点）
 				float mid[3];
-				mid[0] = (seg[0] + seg[3]) * 0.5;
-				mid[1] = (seg[1] + seg[4]) * 0.5;
-				mid[2] = (seg[2] + seg[5]) * 0.5;
-				float d = GL_Distance3D(mid, playerOrigin);
-				if (d < nearDistLimit)
+				gGL_SegmentMids[mode].GetArray(s, mid);
+				float dx = mid[0] - playerOrigin[0];
+				float dy = mid[1] - playerOrigin[1];
+				float dz = mid[2] - playerOrigin[2];
+				float dSq = dx * dx + dy * dy + dz * dz;
+				if (dSq < nearDistLimitSq)
 				{
 					nearIdx[nearCount] = s;
-					nearDist[nearCount] = d;
+					nearDist[nearCount] = dSq; // 存平方距离（排序比较单调一致）
 					nearCount++;
 				}
 			}
@@ -464,7 +491,7 @@ void GL_RenderRouteToClient(int client)
 	{
 		int s = sendOrder[i];
 		float seg[6];
-		gGL_Segments.GetArray(s, seg);
+		gGL_Segments[mode].GetArray(s, seg);
 		float a[3];
 		a[0] = seg[0]; a[1] = seg[1]; a[2] = seg[2];
 		float b[3];
