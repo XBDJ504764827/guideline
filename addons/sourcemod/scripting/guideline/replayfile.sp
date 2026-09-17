@@ -6,8 +6,9 @@
 	- v2: GeneralHeader + RunHeader + delta 压缩 tick 数据
 	- v1: GeneralHeader(v1) + 固定 7 int32/tick 的轨迹数据
 
-	同时提供「读成绩 time」与「解析轨迹」两条管线：
-	- GL_ReadReplayTime(path, time)  同步快速读 header 成绩（三方对比用，不解析轨迹）
+	同时提供「读 header 元信息」与「解析轨迹」两条管线：
+	- GL_ReadReplayMeta(path, meta)  同步快速读 header（course/mode/time/teleports），
+	                                 用于本地录像按模式归类与三方对比，不解析轨迹
 	- GL_StartParsing(path, ...)     分帧异步解析轨迹（路线绘制用）
 */
 
@@ -29,6 +30,20 @@
 // flags 位
 #define RPF_TELEPORT (1 << 22)
 #define RPF_TAKEOFF (1 << 23)
+
+
+
+// =====[ STRUCTS ]=====
+
+// 录像 header 元信息（用于选源：模式归属 / course / 成绩）
+enum struct GL_ReplayMeta
+{
+	int course;     // 录像记录的 course
+	int mode;       // 录像记录的模式（0=VNL 1=SKZ 2=KZT，-1 表示不可用）
+	int teleports;  // 传送次数
+	float time;     // 成绩（秒）
+	bool valid;     // header 读取成功且字段合法
+}
 
 
 
@@ -55,11 +70,25 @@ ArrayList gGL_ParseRaw;
 
 
 
-// =====[ READ TIME (SYNC) ]=====
+// =====[ READ META (SYNC) ]=====
 
-// 从录像文件读取成绩（秒）。支持 v2（当前 GOKZ 格式）与 v1（旧版本）。
-bool GL_ReadReplayTime(const char[] path, float &time)
+// 读取录像 header 元信息（course / mode / teleports / time），兼容 v1/v2。
+// mode/course 是录像生成时写入的权威值，本地录像扫描据此判定模式，
+// 因此文件名不规范（4 段/5 段/被改名）也能正确归类。
+bool GL_ReadReplayMeta(const char[] path, GL_ReplayMeta meta)
 {
+	meta.valid = false;
+	meta.course = -1;
+	meta.mode = -1;
+	meta.teleports = 0;
+	meta.time = 0.0;
+
+	int size = FileSize(path);
+	if (size <= 0 || size > GL_MAX_REPLAY_SIZE)
+	{
+		return false;
+	}
+
 	File file = OpenFile(path, "rb");
 	if (file == null)
 	{
@@ -83,11 +112,11 @@ bool GL_ReadReplayTime(const char[] path, float &time)
 	bool ok;
 	if (version == 2)
 	{
-		ok = ReadV2Time(file, time);
+		ok = ReadV2Meta(file, meta);
 	}
 	else if (version == 1)
 	{
-		ok = ReadV1Time(file, time);
+		ok = ReadV1Meta(file, meta);
 	}
 	else
 	{
@@ -95,72 +124,131 @@ bool GL_ReadReplayTime(const char[] path, float &time)
 	}
 
 	delete file;
-	return ok;
+
+	meta.valid = ok && meta.time > 0.0 && meta.mode >= 0 && meta.mode <= 2;
+	return meta.valid;
 }
 
-// v2：GeneralHeader + RunHeader（time = int32 float 位模式）
-static bool ReadV2Time(File file, float &time)
+// v2：GeneralHeader（含模式）+ RunHeader（time / course / teleportsUsed）
+// 字段顺序与 gokz-replays/recording.sp 的 WriteGeneralHeader 一致
+static bool ReadV2Meta(File file, GL_ReplayMeta meta)
 {
 	int dummy;
 
+	// replayType 必须为 0（Run）：jump/cheater 录像不参与路线选取
 	int replayType;
 	if (!file.ReadInt8(replayType) || replayType != 0)
 	{
-		return false; // 非 Run 录像
+		return false;
 	}
-	if (!SkipString(file) // gokzVersion
+	if (!SkipString(file)  // gokzVersion
 		|| !SkipString(file)) // mapName
 	{
 		return false;
 	}
-	file.ReadInt32(dummy); // mapFileSize
-	file.ReadInt32(dummy); // serverIP
-	file.ReadInt32(dummy); // timestamp
+	if (!ReadInt32Checked(file, dummy)     // mapFileSize
+		|| !ReadInt32Checked(file, dummy)  // serverIP
+		|| !ReadInt32Checked(file, dummy)) // timestamp
+	{
+		return false;
+	}
 	if (!SkipString(file)) // playerAlias
 	{
 		return false;
 	}
-	file.ReadInt32(dummy); // playerSteamID
-	file.ReadInt8(dummy);  // mode
-	file.ReadInt8(dummy);  // style
-	file.ReadInt32(dummy); // playerSensitivity
-	file.ReadInt32(dummy); // playerMYaw
-	file.ReadInt32(dummy); // tickrate
-	file.ReadInt32(dummy); // tickCount
-	file.ReadInt32(dummy); // equippedWeapon
-	file.ReadInt32(dummy); // equippedKnife
+	if (!ReadInt32Checked(file, dummy)) // playerSteamID
+	{
+		return false;
+	}
 
+	int mode; // 权威模式字段
+	if (!file.ReadInt8(mode))
+	{
+		return false;
+	}
+	meta.mode = mode;
+
+	if (!file.ReadInt8(dummy)              // style
+		|| !ReadInt32Checked(file, dummy)  // playerSensitivity
+		|| !ReadInt32Checked(file, dummy)  // playerMYaw
+		|| !ReadInt32Checked(file, dummy)  // tickrate
+		|| !ReadInt32Checked(file, dummy)  // tickCount
+		|| !ReadInt32Checked(file, dummy)  // equippedWeapon
+		|| !ReadInt32Checked(file, dummy)) // equippedKnife
+	{
+		return false;
+	}
+
+	// RunHeader
 	int timeAsInt;
 	if (!file.ReadInt32(timeAsInt))
 	{
 		return false;
 	}
-	time = view_as<float>(timeAsInt);
-	return time > 0.0;
+	meta.time = view_as<float>(timeAsInt);
+
+	int course;
+	if (!file.ReadInt8(course))
+	{
+		return false;
+	}
+	meta.course = course;
+
+	int teleports;
+	if (!file.ReadInt32(teleports))
+	{
+		return false;
+	}
+	meta.teleports = teleports;
+
+	return true;
 }
 
 // v1：魔数+版本 之后为 gokzVersion / mapName 字符串，
-// course / mode / style / time(int32 float) / teleportsUsed / steamAccountID(int32) ...
-static bool ReadV1Time(File file, float &time)
+// course(int32) / mode(int32) / style(int32) / time(float) / teleportsUsed(int32) ...
+static bool ReadV1Meta(File file, GL_ReplayMeta meta)
 {
-	int dummy;
-
-	if (!SkipString(file) // gokzVersion
+	if (!SkipString(file)  // gokzVersion
 		|| !SkipString(file)) // mapName
 	{
 		return false;
 	}
-	file.ReadInt32(dummy); // course
-	file.ReadInt32(dummy); // mode
-	file.ReadInt32(dummy); // style
+
+	int course;
+	if (!file.ReadInt32(course))
+	{
+		return false;
+	}
+	meta.course = course;
+
+	int mode;
+	if (!file.ReadInt32(mode))
+	{
+		return false;
+	}
+	meta.mode = mode;
+
+	int dummy;
+	if (!ReadInt32Checked(file, dummy)) // style
+	{
+		return false;
+	}
 
 	int timeAsInt;
 	if (!file.ReadInt32(timeAsInt))
 	{
 		return false;
 	}
-	time = view_as<float>(timeAsInt);
-	return time > 0.0;
+	meta.time = view_as<float>(timeAsInt);
+
+	int teleports;
+	if (!file.ReadInt32(teleports))
+	{
+		return false;
+	}
+	meta.teleports = teleports;
+
+	return true;
 }
 
 // 跳过长度前缀字符串（int8 长度 + 字节）
@@ -171,12 +259,23 @@ static bool SkipString(File file)
 	{
 		return false;
 	}
-	if (len <= 0)
+	if (len < 0)
 	{
-		return len == 0; // 空字符串合法
+		return false;
+	}
+	if (len == 0)
+	{
+		return true; // 空字符串合法
 	}
 	int[] dummy = new int[len];
 	return file.Read(dummy, len, 1) == len;
+}
+
+// 读 int32 并丢弃；读不到返回 false（避免用未初始化值继续解析错位）
+static bool ReadInt32Checked(File file, int &value)
+{
+	value = 0;
+	return view_as<bool>(file.ReadInt32(value));
 }
 
 
