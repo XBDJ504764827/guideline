@@ -86,3 +86,31 @@ float GL_Distance3D(const float a[3], const float b[3])
 	float dz = a[2] - b[2];
 	return SquareRoot(dx * dx + dy * dy + dz * dz);
 }
+
+// 点到线段的垂直距离（投影落在段外时取到最近端点距离）
+// 共线合并判定用：检查中间点偏离弦的程度
+float GL_PointSegmentDistance(const float a[3], const float b[3], const float p[3])
+{
+	float ab[3], ap[3];
+	ab[0] = b[0] - a[0];
+	ab[1] = b[1] - a[1];
+	ab[2] = b[2] - a[2];
+	ap[0] = p[0] - a[0];
+	ap[1] = p[1] - a[1];
+	ap[2] = p[2] - a[2];
+
+	float lenSq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+	if (lenSq < 0.0001)
+	{
+		return SquareRoot(ap[0] * ap[0] + ap[1] * ap[1] + ap[2] * ap[2]);
+	}
+
+	float t = (ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / lenSq;
+	if (t < 0.0) t = 0.0;
+	if (t > 1.0) t = 1.0;
+
+	float dx = a[0] + ab[0] * t - p[0];
+	float dy = a[1] + ab[1] * t - p[1];
+	float dz = a[2] + ab[2] * t - p[2];
+	return SquareRoot(dx * dx + dy * dy + dz * dz);
+}

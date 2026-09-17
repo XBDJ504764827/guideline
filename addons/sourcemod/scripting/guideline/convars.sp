@@ -18,6 +18,9 @@ ConVar gCV_BeamLifetime;
 ConVar gCV_BeamWidth;
 ConVar gCV_Smooth;
 ConVar gCV_SmoothPoints;
+ConVar gCV_Simplify;
+ConVar gCV_SimplifyTol;
+ConVar gCV_SimplifyMaxLen;
 ConVar gCV_SampleDist;
 ConVar gCV_BreakDist;
 ConVar gCV_VerticalBreakDist;
@@ -28,6 +31,12 @@ ConVar gCV_DownloadTimeout;
 ConVar gCV_BatchSize;
 ConVar gCV_NearDist;
 
+
+
+// 颜色缓存：渲染热路径每 tick 每玩家都要用，不能每次解析字符串。
+// gokz_guideline_color 变化时刷新一次（见 OnColorConVarChanged）。
+int gGL_ColorCache[4] = {148, 0, 211, 110};
+bool gGL_ColorCacheReady;
 
 
 // =====[ COOKIE ]=====
@@ -64,6 +73,12 @@ void GL_CreateConVars()
 		"路线平滑开关：Chaikin 角切割细分，拐角处切出圆角（与 JumpBeam 视觉一致）。", _, true, 0.0, true, 1.0);
 	gCV_SmoothPoints = AutoExecConfig_CreateConVar("gokz_guideline_smooth_points", "2",
 		"Chaikin 细分迭代次数（0-3）：越大越圆润，每迭代一次段数约 ×2（默认 2 次圆角清晰）。", _, true, 0.0, true, 3.0);
+	gCV_Simplify = AutoExecConfig_CreateConVar("gokz_guideline_simplify", "1",
+		"保形简化开关：把近似共线的短段合并成长段。\n		Chaikin 的价值只在拐角，直线段碎片化只增加开销；\n		合并后发送量约降为 1/6~1/8，拐角圆弧完整保留。", _, true, 0.0, true, 1.0);
+	gCV_SimplifyTol = AutoExecConfig_CreateConVar("gokz_guideline_simplify_tol", "2.0",
+		"保形简化容差（units）：中间点偏离合并弦超过该值则不合并。\n		即线条最大形变上限；玩家模型宽约 32 units，默认 2.0 肉眼不可见。", _, true, 0.1, true, 32.0);
+	gCV_SimplifyMaxLen = AutoExecConfig_CreateConVar("gokz_guideline_simplify_max_len", "256.0",
+		"保形简化单段最大长度（units）：限制合并后的段长，避免产生过长的单条光束\n		（过长的 beam 在客户端可能有裁剪/精度问题）。", _, true, 32.0, true, 2048.0);
 	gCV_SampleDist = AutoExecConfig_CreateConVar("gokz_guideline_sample_dist", "32.0",
 		"轨迹降采样距离阈值（units）：相邻保留点水平距离小于该值则丢弃（起跳点除外）。", _, true, 8.0, true, 512.0);
 	gCV_BreakDist = AutoExecConfig_CreateConVar("gokz_guideline_break_dist", "1000.0",
@@ -85,6 +100,16 @@ void GL_CreateConVars()
 
 	AutoExecConfig_ExecuteFile();
 	AutoExecConfig_CleanFile();
+
+	// 颜色热更新：ConVar 变更时刷新缓存（渲染热路径只读缓存，不解析字符串）
+	gCV_Color.AddChangeHook(OnColorConVarChanged);
+	gGL_ColorCacheReady = false;
+}
+
+public void OnColorConVarChanged(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+	GL_RefreshColorCache();
+	gGL_ColorCacheReady = true;
 }
 
 void GL_CreateCookies()
@@ -133,6 +158,21 @@ int GL_GetSmoothPoints()
 	return gCV_SmoothPoints.IntValue;
 }
 
+bool GL_GetSimplify()
+{
+	return gCV_Simplify.BoolValue;
+}
+
+float GL_GetSimplifyTol()
+{
+	return gCV_SimplifyTol.FloatValue;
+}
+
+float GL_GetSimplifyMaxLen()
+{
+	return gCV_SimplifyMaxLen.FloatValue;
+}
+
 float GL_GetSampleDist()
 {
 	return gCV_SampleDist.FloatValue;
@@ -178,7 +218,24 @@ float GL_GetNearDist()
 	return gCV_NearDist.FloatValue;
 }
 
+// 颜色缓存：渲染热路径每 tick 每玩家都要用，不能每次解析字符串。
+// gokz_guideline_color 变化时刷新一次（OnConVarChanged）。
 void GL_GetColor(int color[4])
+{
+	// 热路径：直接读缓存；首次或变更时由 GL_RefreshColorCache 填充
+	if (!gGL_ColorCacheReady)
+	{
+		GL_RefreshColorCache();
+		gGL_ColorCacheReady = true;
+	}
+	for (int i = 0; i < 4; i++)
+	{
+		color[i] = gGL_ColorCache[i];
+	}
+}
+
+// 解析 gokz_guideline_color "R G B A" → 缓存
+void GL_RefreshColorCache()
 {
 	char raw[32];
 	gCV_Color.GetString(raw, sizeof(raw));
@@ -186,8 +243,9 @@ void GL_GetColor(int color[4])
 	int count = ExplodeString(raw, " ", parts, sizeof(parts), sizeof(parts[]));
 	for (int i = 0; i < 4; i++)
 	{
-		color[i] = (i < count) ? StringToInt(parts[i]) : 255;
-		if (color[i] < 0) color[i] = 0;
-		if (color[i] > 255) color[i] = 255;
+		int v = (i < count) ? StringToInt(parts[i]) : 255;
+		if (v < 0) v = 0;
+		if (v > 255) v = 255;
+		gGL_ColorCache[i] = v;
 	}
 }
