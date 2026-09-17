@@ -72,17 +72,6 @@ bool GL_FindFastestLocalReplay(char[] pathOutput, int maxlength, float &bestTime
 			continue;
 		}
 
-		// 模式隔离：只选目标模式的录像
-		if (targetMode >= 0 && targetMode <= 2)
-		{
-			char wantMode[8];
-			GL_GetModeShortName(targetMode, wantMode, sizeof(wantMode));
-			if (!StrEqual(modeShort, wantMode, false))
-			{
-				continue;
-			}
-		}
-
 		BuildPath(Path_SM, fullPath, sizeof(fullPath), "%s/%s", GL_REPLAY_DIRECTORY, gC_MapName);
 		Format(fullPath, sizeof(fullPath), "%s/%s", fullPath, fileName);
 		scanned++;

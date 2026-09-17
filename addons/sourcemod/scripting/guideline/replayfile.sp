@@ -6,8 +6,9 @@
 	- v2: GeneralHeader + RunHeader + delta 压缩 tick 数据
 	- v1: GeneralHeader(v1) + 固定 7 int32/tick 的轨迹数据
 
-	同时提供「读成绩 time」与「解析轨迹」两条管线：
-	- GL_ReadReplayTime(path, time)  同步快速读 header 成绩（三方对比用，不解析轨迹）
+	同时提供「读 header 元信息」与「解析轨迹」两条管线：
+	- GL_ReadReplayMeta(path, meta)  同步快速读 header（course/mode/time/teleports），
+	                                 用于本地录像按模式归类与三方对比，不解析轨迹
 	- GL_StartParsing(path, ...)     分帧异步解析轨迹（路线绘制用）
 */
 
