@@ -38,7 +38,9 @@
                                      //   同一段两次重发间隔最坏约 3.3s < 4s 存活，留足余量）
 #define GL_WIN_BACK_SCALE 0.5        // 回看窗口 = near_dist × 该系数
 #define GL_WIN_FWD_SCALE 1.0         // 前看窗口 = near_dist × 该系数
-#define GL_MIN_BATCH 4               // 每周期最少续期段数
+#define GL_MIN_BATCH 2               // 每周期最少续期段数（地板值；下限过高会白吞掉保形简化的收益）
+                                     // 实测窗口 21~36 段（简化后）时，下限 2 的最坏重发间隔
+                                     // 约 2.55s < 4s 存活时间，各速度下均有 1.45s 以上余量
 #define GL_MAX_NEW_AHEAD 24          // 每周期最多立即补发的「前方新进入窗口」段数
                                      // （段长 8 units、周期 0.15s 时约合 1280 u/s，
                                      //   高于高速连跳，配额用尽会自动顺延到下周期，不丢段）
@@ -343,6 +345,75 @@ static void GL_ComputeWindow(int mode)
 	gGL_WinFwd[mode] = fwd;
 }
 
+// 保形共线简化：把近似共线的相邻点合并，返回新的点序列。
+// 贪心策略：从当前点出发尽量向前延伸，只要「中间所有点偏离弦」不超过 tol
+// 且弦长不超过 maxLen 就继续延伸；否则落点、从该点重新开始。
+// 拐角处中间点偏离弦必然超限 → 自然终止延伸，圆弧得以保留。
+// 仅在构建线段缓存时调用一次（非热路径）。
+static ArrayList SimplifyCollinear(ArrayList pts, float tol, float maxLen)
+{
+	ArrayList out = new ArrayList(3);
+	int n = pts.Length;
+	if (n == 0)
+	{
+		return out;
+	}
+
+	float first[3];
+	pts.GetArray(0, first);
+	out.PushArray(first);
+	if (n == 1)
+	{
+		return out;
+	}
+
+	int anchor = 0;
+	while (anchor < n - 1)
+	{
+		int best = anchor + 1;
+		int cand = anchor + 2;
+
+		while (cand < n)
+		{
+			float a[3], b[3];
+			pts.GetArray(anchor, a);
+			pts.GetArray(cand, b);
+
+			if (GL_Distance3D(a, b) > maxLen)
+			{
+				break;
+			}
+
+			// 检查 anchor..cand 之间每个点偏离弦的程度
+			bool ok = true;
+			for (int k = anchor + 1; k < cand; k++)
+			{
+				float p[3];
+				pts.GetArray(k, p);
+				if (GL_PointSegmentDistance(a, b, p) > tol)
+				{
+					ok = false;
+					break;
+				}
+			}
+			if (!ok)
+			{
+				break;
+			}
+
+			best = cand;
+			cand++;
+		}
+
+		float bp[3];
+		pts.GetArray(best, bp);
+		out.PushArray(bp);
+		anchor = best;
+	}
+
+	return out;
+}
+
 // 对点序列做 Chaikin 细分并把所有线段直接写入该模式的固定数组
 static void BuildSegmentsFromSequence(int mode, ArrayList seq, int iter)
 {
@@ -384,6 +455,17 @@ static void BuildSegmentsFromSequence(int mode, ArrayList seq, int iter)
 
 		delete cur;
 		cur = next;
+	}
+
+	// 保形简化：把近似共线的短段合并成长段。
+	// Chaikin 的价值只在拐角（切出圆弧），直线段被切成 8u 碎片纯属浪费——
+	// 而发送量正比于「1/平均段长」（窗口段数 = near_dist ÷ 平均段长），
+	// 因此合并直线段可成倍降低渲染开销，且拐角圆弧完整保留（不满足共线条件）。
+	if (GL_GetSimplify())
+	{
+		ArrayList simplified = SimplifyCollinear(cur, GL_GetSimplifyTol(), GL_GetSimplifyMaxLen());
+		delete cur;
+		cur = simplified;
 	}
 
 	// 写入缓存（每段 6 float；超出硬容量则停止，保证不越界）

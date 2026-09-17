@@ -68,6 +68,13 @@ float gGL_ParseTime;
 int gGL_ParseTeleports;
 ArrayList gGL_ParseRaw;
 
+// v2 delta 解压的字段状态：必须跨 tick 保留（与 gokz-replays/playback.sp 一致）。
+// 录像每帧只写「相对上一帧有变化的字段」，未置位的字段语义是「沿用上一帧的值」。
+// 若每帧都从 0 开始，玩家短暂静止（origin 不变、掩码不置位）时坐标会被解析成
+// (0,0,0)，在画面上表现为从当前位置连到世界原点、再连回来的杂线。
+int gGL_TickFields[GL_RP_TICK_BLOCK];
+bool gGL_TickFieldsValid;
+
 
 
 // =====[ READ META (SYNC) ]=====
@@ -499,6 +506,8 @@ static void CleanupStream()
 	gGL_ParsePlayer[0] = '\0';
 	gGL_ParseTime = 0.0;
 	gGL_ParseTeleports = 0;
+	// delta 字段状态必须清掉：否则下一份录像的首帧会沿用上一份录像末帧的值
+	gGL_TickFieldsValid = false;
 }
 
 
@@ -727,8 +736,18 @@ static bool ParseOneTick()
 		return false;
 	}
 
-	int fields[GL_RP_TICK_BLOCK];
-	fields[0] = deltaFlags;
+	// 关键：沿用上一帧的字段值（不重置 gGL_TickFields）。
+	// 首帧掩码全置位，因此首次进入时所有字段都会被写入，不存在未初始化值。
+	if (!gGL_TickFieldsValid)
+	{
+		for (int i = 0; i < GL_RP_TICK_BLOCK; i++)
+		{
+			gGL_TickFields[i] = 0;
+		}
+		gGL_TickFieldsValid = true;
+	}
+	gGL_TickFields[0] = deltaFlags;
+
 	for (int idx = 1; idx < GL_RP_TICK_BLOCK; idx++)
 	{
 		if (deltaFlags & (1 << idx))
@@ -738,16 +757,16 @@ static bool ParseOneTick()
 			{
 				return false;
 			}
-			fields[idx] = v;
+			gGL_TickFields[idx] = v;
 		}
 	}
 
 	// 只保留 origin、flags 与 tick 索引
-	tp.origin[0] = view_as<float>(fields[RPDELTA_ORIGIN_X]);
-	tp.origin[1] = view_as<float>(fields[RPDELTA_ORIGIN_Y]);
-	tp.origin[2] = view_as<float>(fields[RPDELTA_ORIGIN_Z]);
-	tp.isTeleport = (fields[RPDELTA_FLAGS] & RPF_TELEPORT) != 0;
-	tp.isTakeoff = (fields[RPDELTA_FLAGS] & RPF_TAKEOFF) != 0;
+	tp.origin[0] = view_as<float>(gGL_TickFields[RPDELTA_ORIGIN_X]);
+	tp.origin[1] = view_as<float>(gGL_TickFields[RPDELTA_ORIGIN_Y]);
+	tp.origin[2] = view_as<float>(gGL_TickFields[RPDELTA_ORIGIN_Z]);
+	tp.isTeleport = (gGL_TickFields[RPDELTA_FLAGS] & RPF_TELEPORT) != 0;
+	tp.isTakeoff = (gGL_TickFields[RPDELTA_FLAGS] & RPF_TAKEOFF) != 0;
 	tp.tick = gGL_ParseTicksDone;
 
 	gGL_ParseRaw.PushArray(tp);
