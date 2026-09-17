@@ -8,7 +8,7 @@
 #endif
 #define _guideline_version_included_
 
-#define GL_VERSION "0.1.6"
+#define GL_VERSION "0.1.7"
 #define GL_VERSION_MAJOR 0
 #define GL_VERSION_MINOR 1
-#define GL_VERSION_PATCH 6
+#define GL_VERSION_PATCH 7
