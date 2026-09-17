@@ -1,7 +1,15 @@
 /*
 	Guideline - Local Replay Scan
 	扫描服务器本地 GOKZ 录像目录（data/gokz-replays/_runs/<map>/），
-	读取每份录像 header 中的成绩 time，找出该地图 course 0 的最快录像。
+	读取每份录像 header 中的 course / mode / 成绩 time，找出该地图 course 0
+	指定模式的最快录像。
+
+	【为什么不依赖文件名】
+	  GOKZ 的录像文件名格式并不稳定：既有 4 段 `<course>_<MODE>_<STYLE>_<TIMETYPE>.replay`
+	  （如 0_SKZ_NRM_PRO.replay），也有 5 段 `<steamId>_<course>_<MODE>_<STYLE>_<TIMETYPE>.replay`
+	  （如 0_0_VNL_NRM_NUB.replay、365313220_0_KZT_NRM_PRO.replay），
+	  还可能被第三方工具改名。而录像 header 里写的 mode/course/teleports 是
+	  录像生成时的权威值，因此本模块**只按 header 判定**，文件名完全不参与匹配。
 
 	用于「三方对比」（缓存 / 本地 / R2），选择最小 time 作为路线源：
 	  1. 插件自己从 R2 下载并存下的缓存（data/gokz-guideline/）
@@ -17,28 +25,11 @@
 
 
 
-// =====[ STRUCTS ]=====
-
-// 本地录像扫描结果
-enum struct LocalReplayEntry
-{
-	char path[PLATFORM_MAX_PATH];
-	float time;
-	
-	// 以下用于日志/调试
-	char modeShort[8];
-	char typeStr[8];
-	char playerName[32];
-	
-	bool valid;
-}
-
-
-
 // =====[ PUBLIC ]=====
 
 // 扫描当前地图 data/gokz-replays/_runs/<map>/ 中 course 0 的 RUN 录像，
 // 只选择指定模式的录像，返回成绩最快的一条（time 最小）。
+// 模式判定完全依赖录像 header（不解析文件名），因此文件名不规范也能正确归类。
 // 无该模式录像时返回 false（绝不混用其他模式）。
 bool GL_FindFastestLocalReplay(char[] pathOutput, int maxlength, float &bestTime, int targetMode = -1)
 {
@@ -66,6 +57,7 @@ bool GL_FindFastestLocalReplay(char[] pathOutput, int maxlength, float &bestTime
 
 	float bestFound = 0.0;
 	char bestPath[PLATFORM_MAX_PATH];
+	int scanned = 0;
 
 	while (listing.GetNext(fileName, sizeof(fileName), type))
 	{
@@ -74,39 +66,39 @@ bool GL_FindFastestLocalReplay(char[] pathOutput, int maxlength, float &bestTime
 			continue;
 		}
 
-		// 解析文件名：<course>_<MODE>_<STYLE>_<TIMETYPE>.replay
-		int course;
-		char modeShort[8];
-		char typeStr[8];
-		if (!GL_ParseRunFileName(fileName, course, modeShort, sizeof(modeShort), typeStr, sizeof(typeStr)))
+		// 只处理 .replay 后缀（大小写不敏感）
+		if (StrContains(fileName, ".replay", false) == -1)
 		{
 			continue;
-		}
-
-		// 模式隔离：只选目标模式的录像
-		if (targetMode >= 0 && targetMode <= 2)
-		{
-			char wantMode[8];
-			GL_GetModeShortName(targetMode, wantMode, sizeof(wantMode));
-			if (!StrEqual(modeShort, wantMode, false))
-			{
-				continue;
-			}
 		}
 
 		BuildPath(Path_SM, fullPath, sizeof(fullPath), "%s/%s", GL_REPLAY_DIRECTORY, gC_MapName);
 		Format(fullPath, sizeof(fullPath), "%s/%s", fullPath, fileName);
+		scanned++;
 
-		float time;
-		if (!GL_ReadReplayTime(fullPath, time))
+		// 权威判定：读 header 里的 course / mode / teleports / time
+		GL_ReplayMeta meta;
+		if (!GL_ReadReplayMeta(fullPath, meta))
 		{
-			GL_LogDebug("Cannot read time from local replay: %s", fullPath);
+			GL_LogDebug("Cannot read replay header: %s", fullPath);
 			continue;
 		}
 
-		if (bestFound == 0.0 || time < bestFound)
+		// 只认 course 0（主图）；B1/B2 忽略
+		if (meta.course != 0)
 		{
-			bestFound = time;
+			continue;
+		}
+
+		// 模式隔离：只选目标模式的录像（按 header 的 mode 字段判定）
+		if (targetMode >= 0 && targetMode <= 2 && meta.mode != targetMode)
+		{
+			continue;
+		}
+
+		if (bestFound == 0.0 || meta.time < bestFound)
+		{
+			bestFound = meta.time;
 			strcopy(bestPath, sizeof(bestPath), fullPath);
 		}
 	}
@@ -115,85 +107,14 @@ bool GL_FindFastestLocalReplay(char[] pathOutput, int maxlength, float &bestTime
 
 	if (bestFound <= 0.0)
 	{
-		GL_LogDebug("No valid local replay found for %s mode %d", gC_MapName, targetMode);
+		GL_LogDebug("No valid local replay found for %s mode %d (scanned %d files)",
+			gC_MapName, targetMode, scanned);
 		return false;
 	}
 
 	strcopy(pathOutput, maxlength, bestPath);
 	bestTime = bestFound;
-	GL_LogDebug("Fastest local replay: %s (time=%.2f)", bestPath, bestFound);
+	GL_LogDebug("Fastest local replay: %s (time=%.2f, scanned=%d)", bestPath, bestFound, scanned);
 	return true;
 }
 
-// 解析 GOKZ 永久录像文件名（兼容新旧）：
-//  4 段: <course>_<MODE>_<STYLE>_<TIMETYPE>.replay  例: 0_SKZ_NRM_PRO.replay
-//  5 段: <steamId>_<course>_<MODE>_<STYLE>_<TIMETYPE>.replay 例: 0_0_KZT_NRM_NUB.replay / 365313220_0_SKZ_NRM_NUB.replay
-// 只认 course 0、合法模式（vnl/skz/kzt）；PRO=pro 其余按 tp (NUB)。
-bool GL_ParseRunFileName(const char[] fileName, int &course, char[] modeShort, int modeShortLen, char[] typeStr, int typeStrLen)
-{
-	char buf[PLATFORM_MAX_PATH];
-	strcopy(buf, sizeof(buf), fileName);
-	int dot = StrContains(buf, ".replay");
-	if (dot == -1)
-	{
-		return false;
-	}
-	buf[dot] = '\0';
-	char parts[5][16];
-	int n = ExplodeString(buf, "_", parts, sizeof(parts), sizeof(parts[]));
-	if (n == 5)
-	{
-		course = StringToInt(parts[1]);
-		if (course != 0) return false;
-		strcopy(modeShort, modeShortLen, parts[2]);
-		GL_ToLower(modeShort, modeShortLen);
-		if (!StrEqual(modeShort, "vnl") && !StrEqual(modeShort, "skz") && !StrEqual(modeShort, "kzt")) return false;
-		if (StrEqual(parts[4], "PRO", false)) strcopy(typeStr, typeStrLen, "pro");
-		else strcopy(typeStr, typeStrLen, "tp");
-		return true;
-	}
-	if (n < 4) return false;
-	course = StringToInt(parts[0]);
-	if (course != 0) return false;
-	strcopy(modeShort, modeShortLen, parts[1]);
-	GL_ToLower(modeShort, modeShortLen);
-	if (!StrEqual(modeShort, "vnl") && !StrEqual(modeShort, "skz") && !StrEqual(modeShort, "kzt")) return false;
-	if (StrEqual(parts[3], "PRO", false)) strcopy(typeStr, typeStrLen, "pro");
-	else strcopy(typeStr, typeStrLen, "tp");
-	return true;
-}
-
-// 完整解析（5 段新结构）：返回 steamId/course/mode/style/type，用于兼容校验/日志
-#pragma unused GL_ParseRunFileNameFull
-bool GL_ParseRunFileNameFull(const char[] fileName, char[] steamId, int steamIdLen, int &course, char[] modeShort, int modeShortLen, char[] style, int styleLen, char[] typeStr, int typeStrLen)
-{
-	char buf[PLATFORM_MAX_PATH];
-	strcopy(buf, sizeof(buf), fileName);
-	int dot = StrContains(buf, ".replay");
-	if (dot == -1) return false;
-	buf[dot] = '\0';
-	char parts[5][16];
-	int n = ExplodeString(buf, "_", parts, sizeof(parts), sizeof(parts[]));
-	if (n == 5)
-	{
-		strcopy(steamId, steamIdLen, parts[0]);
-		course = StringToInt(parts[1]);
-		if (course != 0) return false;
-		strcopy(modeShort, modeShortLen, parts[2]); GL_ToLower(modeShort, modeShortLen);
-		if (!StrEqual(modeShort, "vnl") && !StrEqual(modeShort, "skz") && !StrEqual(modeShort, "kzt")) return false;
-		strcopy(style, styleLen, parts[3]); GL_ToLower(style, styleLen);
-		if (StrEqual(parts[4], "PRO", false)) strcopy(typeStr, typeStrLen, "pro");
-		else strcopy(typeStr, typeStrLen, "tp");
-		return true;
-	}
-	if (n < 4) return false;
-	strcopy(steamId, steamIdLen, "0");
-	course = StringToInt(parts[0]);
-	if (course != 0) return false;
-	strcopy(modeShort, modeShortLen, parts[1]); GL_ToLower(modeShort, modeShortLen);
-	if (!StrEqual(modeShort, "vnl") && !StrEqual(modeShort, "skz") && !StrEqual(modeShort, "kzt")) return false;
-	strcopy(style, styleLen, parts[2]); GL_ToLower(style, styleLen);
-	if (StrEqual(parts[3], "PRO", false)) strcopy(typeStr, typeStrLen, "pro");
-	else strcopy(typeStr, typeStrLen, "tp");
-	return true;
-}

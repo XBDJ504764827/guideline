@@ -20,9 +20,14 @@
 
 | 优先级 | 来源 | 目录/键名 |
 |---|---|---|
-| 1 | 插件下载缓存 | `addons/sourcemod/data/gokz-guideline/<map>_pro.replay` |
+| 1 | 插件下载缓存 | `addons/sourcemod/data/gokz-guideline/<map>_<mode>_pro.replay` |
 | 2 | 服务器本地 GOKZ 录像 | `addons/sourcemod/data/gokz-replays/_runs/<map>/`（course 0） |
-| 3 | R2 存储 | `{base}/wr/{<vnl|skz|kzt>}/<map>/<pro|tp>.replay` |
+| 3 | R2 存储 | `{base}/wr/{<map>}/0_0_<VNL|SKZ|KZT>_NRM_<PRO|NUB>.replay` |
+
+**本地录像按 header 归类（不解析文件名）**：本服 `_runs/<map>/` 下的文件名并不规范，既有 4 段
+`0_SKZ_NRM_PRO.replay`，也有 5 段 `0_0_VNL_NRM_NUB.replay` / `365313220_0_KZT_NRM_PRO.replay`，
+还可能被第三方改名。因此 `localreplay.sp` 只读录像 header 里的 **course / mode / time / teleports**
+（v1/v2 均支持），文件名完全不参与匹配。
 
 检查时机：换图 3 秒后自动 + `!routerefresh` 手动强制刷新 +
 **本服破纪录保存新录像时自动触发一次检查**（GOKZ_RP_OnReplaySaved，
@@ -30,10 +35,12 @@
 
 ### 1.3 显示规则
 
-- `!gl` 每玩家独立开关（Cookie `gokz-guideline-enabled` 持久化），只发给本人
-- 不依赖计时状态：开启后常驻显示（定时重发，refresh_interval=2.0s < beam_lifetime=4.0s）
+- `!gl` 每玩家独立开关（内存态，换图/重连后默认关闭，需手动开启），只发给本人
+- **附近窗口渲染**：只绘制玩家周围窗口内的段，窗口 = 前方 `near_dist`（默认 1500 units）+ 后方 `near_dist × 0.5`
+- 窗口内滚动续期：每 0.15s 发一批，使整窗在 `beam_lifetime × 0.4`（默认 1.6s）内滚动一遍；实测各速度下同一段两次重发最坏约 3.3s < 4s 存活时间 → 连续不闪烁
+- 发送量约 180 条/秒/人，与路线总长无关（旧版全图轮转约 1067 条/秒）
 - 线条参数与 GOKZ JumpBeam 完全一致：`laserbeam.vmt`、Width=0.25、FadeLength=10、Amplitude=0、Speed=0
-- 颜色默认紫色 `148 0 211 110`；Chaikin 平滑 1 次迭代
+- 颜色默认紫色 `148 0 211 110`；Chaikin 平滑 2 次迭代
 - 传送点（flags bit 22）断开不连线
 
 ### 1.4 核心约束
@@ -44,6 +51,7 @@
 | 依赖最少 | 运行时：SourceMod 1.11、SteamWorks（R2 下载）、gokz-core；不依赖数据库 |
 | 异步下载 | R2 下载用 SteamWorks 回调，绝不阻塞主线程 |
 | 解析不卡服 | 大录像分帧解析（CreateTimer 分批，默认 5000 帧/批） |
+| 渲染不卡服 | 热路径无临时堆分配、无 ArrayList/native 调用；线段存固定二维数组直接下标访问 |
 | 只支持主图 | course 0；B1/B2 忽略 |
 
 ---
@@ -62,11 +70,11 @@ guideline/                          # 项目根（= 本仓库）
 │       │   ├── guideline/          # 模块目录（均被 guideline.sp include）
 │       │   │   ├── convars.sp      # ConVar 创建与读取封装 + Cookie
 │       │   │   ├── helpers.sp      # 字符串/客户端/日志/距离工具
-│       │   │   ├── state.sp        # 玩家 !gl 开关状态（Cookie 镜像）
-│       │   │   ├── replayfile.sp   # .replay 二进制解析（v1/v2）+ 读时间
-│       │   │   ├── localreplay.sp  # 扫描本服 _runs 目录找最快录像
+│       │   │   ├── state.sp        # 玩家 !gl 开关状态
+│       │   │   ├── replayfile.sp   # .replay 二进制解析（v1/v2）+ header 元信息（course/mode/time）
+│       │   │   ├── localreplay.sp  # 扫描本服 _runs 目录：按 header 的 mode 归类，找最快录像
 │       │   │   ├── routes.sp       # 路线数据管理：降采样、缓存路径、来源
-│       │   │   ├── render.sp       # beam 渲染（JumpBeam 同款参数）
+│       │   │   ├── render.sp       # 附近窗口渲染（JumpBeam 同款参数）
 │       │   │   ├── http.sp         # SteamWorks HTTP：meta 两阶段下载 + 三方对比
 │       │   │   └── commands.sp     # !gl / !routerefresh 命令
 │       │   └── include/
@@ -113,9 +121,27 @@ guideline/                          # 项目根（= 本仓库）
        │          └─ 网络失败 → FinishWithLocalOrCache
        └─ GL_StartParsing（分帧）
              └─ FinishParsing → GL_Downsample → GL_RouteFinishParsed
-                   └─ gGL_Route.loaded = true
-                        └─ 渲染定时器 GL_Timer_Render 每 2s 给开启 !gl 的玩家画线
+                   └─ gGL_Routes[mode].loaded = true
+                        └─ GL_RebuildCacheForMode（Chaikin 细分 → 固定数组 + 换算窗口）
+                             └─ 渲染定时器 GL_Timer_Render 每 0.15s
+                                  给开启 !gl 的玩家续期「附近窗口」内的线条
 ```
+
+### 3.1 渲染流程（render.sp）
+
+```
+GL_Timer_Render（每 0.15s）
+  └─ 对每个开启 !gl 且存活的玩家：
+       ├─ GL_UpdateCursor   进度游标：局部搜 cursor±(128/256)；
+       │                    偏离 near_dist 时全局粗扫（256 步）+ 细化（每 32 tick 限流）
+       ├─ 计算窗口 [cursor-back, cursor+fwd]（back/fwd 由 near_dist ÷ 平均段长换算）
+       ├─ 新进入窗口的段立即补发（上限 16 条/周期，配额用尽则下周期续，不丢段）
+       └─ 窗口内滚动续期：额度 = 窗口段数 × 0.15 / (life × 0.4)，
+                          静态线条只需在过期前重发即可
+```
+
+线段存于 `float gGL_Segs[3][5120*6]`（每模式一份扁平数组），热路径全部是下标访问：
+无 `ArrayList.GetArray`、无临时 `new`、无排序。
 
 ---
 
@@ -138,16 +164,17 @@ bestSource = min(localTime, cacheTime, remoteTime)
 ## 5. R2 协议（与 stratosphere 完全一致）
 
 ```
-GET {base}/wr/{mode}/{map}/{type}.replay?meta=1
+GET {base}/wr/{map}/0_0_{MODE}_NRM_{TYPE}.replay?meta=1
   Headers: X-API-Key: <key>
   → 200 {"exists":true,"time_ms":42130,"sha256":"...","size":6188}
-GET {base}/wr/{mode}/{map}/{type}.replay
+GET {base}/wr/{map}/0_0_{MODE}_NRM_{TYPE}.replay
   Headers: X-API-Key: <key>
   → 200 二进制录像（响应头 x-sha256）
   → 404 无录像
 
-mode = vnl|skz|kzt（遍历顺序：服务器默认模式 → 其余两种）
-type = pro|tp（pro 优先，404 回退 tp）
+例: {base}/wr/kz_bhop_easy/0_0_KZT_NRM_PRO.replay
+mode = VNL|SKZ|KZT（遍历顺序：服务器默认模式 → 其余两种）
+type = PRO|NUB（PRO 优先，404 回退 NUB）
 map  = 服务器当前地图（小写 URLEncode）
 ```
 
@@ -155,8 +182,10 @@ map  = 服务器当前地图（小写 URLEncode）
 
 ## 6. 录像格式要点（replayfile.sp）
 
-- v2：`GeneralHeader`（魔数 0x676F6B7A / 版本 2 / replayType=0(Run) / ... / tickrate / tickCount / ...）+ `RunHeader`（time float / course / teleportsUsed）+ delta 压缩 tick 数据
-- v1：旧格式，固定 7 int32/tick
+- 选源用 header 元信息（`GL_ReadReplayMeta`）：
+  - v2：`GeneralHeader`（魔数 0x676F6B7A / 版本 2 / replayType=0(Run) / ... / **mode(int8)** / style / tickrate / tickCount / ...）+ `RunHeader`（time float / **course(int8)** / teleportsUsed）+ delta 压缩 tick 数据
+  - v1：旧格式，magic+version 后为 gokzVersion/mapName 字符串，然后 course(int32) / **mode(int32)** / style(int32) / time(float) / teleportsUsed(int32)，tick 数据固定 7 int32/tick
+  - **本地录像模式判定只依据 header 的 mode/course**，不解析文件名（命名不规范也能正确归类）
 - tick 数据关注字段：`ORIGIN_X/Y/Z`（索引 7/8/9）、`FLAGS`（索引 16，bit 22=传送、bit 23=起跳）
 - delta 压缩：每 tick 一个 int32 位掩码，置位字段才写值；首 tick 全置位
 - 解析采用「文件流 + 分帧定时器」，避免一次读入大录像卡服（上限 8MB / 100 万 tick）
@@ -174,11 +203,14 @@ map  = 服务器当前地图（小写 URLEncode）
 | gokz_guideline_color | 148 0 211 110 | 紫色线条 |
 | gokz_guideline_beam_lifetime | 4.0 | 与 JumpBeam 一致 |
 | gokz_guideline_beam_width | 0.25 | 与 JumpBeam 一致 |
-| gokz_guideline_refresh_interval | 2.0 | 重发间隔（< lifetime） |
-| gokz_guideline_smooth / smooth_points | 1 / 1 | Chaikin 平滑 |
+| gokz_guideline_near_dist | 1500.0 | 窗口半径（units），**主要性能旋钮** |
+| gokz_guideline_batch_size | 96 | 每周期发送硬顶（兜底；自动值由窗口换算） |
+| gokz_guideline_smooth / smooth_points | 1 / 2 | Chaikin 平滑 |
 | gokz_guideline_sample_dist | 32.0 | 降采样距离（3D）|
 | gokz_guideline_break_dist | 1000.0 | 断点判定（3D 距离）|
 | gokz_guideline_vertical_break_dist | 300.0 | 双层断点（水平 <64 且垂直 >300 断开）|
+
+> 渲染周期固定 0.15s（`GL_RENDER_INTERVAL`）；cfg 中的 `gokz_guideline_refresh_interval` 仅作记录，不再驱动定时器。
 
 ---
 
