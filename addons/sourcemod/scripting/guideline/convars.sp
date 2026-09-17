@@ -57,7 +57,7 @@ void GL_CreateConVars()
 	gCV_Color = AutoExecConfig_CreateConVar("gokz_guideline_color", "148 0 211 110",
 		"路线线条颜色 \"R G B A\"（0-255）。默认为紫色。");
 	gCV_BeamLifetime = AutoExecConfig_CreateConVar("gokz_guideline_beam_lifetime", "4.0",
-		"线条存活时间（秒），与 GOKZ JumpBeam 一致。" , _, true, 0.5, true, 10.0);
+		"线条存活时间（秒），与 GOKZ JumpBeam 一致。\n		性能旋钮：续期频率与存活时间成反比，调大可线性降低发送量，\n		代价是玩家离开后线条残留更久（视觉上拖尾更长）。" , _, true, 1.0, true, 20.0);
 	gCV_BeamWidth = AutoExecConfig_CreateConVar("gokz_guideline_beam_width", "0.25",
 		"线条宽度（与 GOKZ JumpBeam 一致）。", _, true, 0.1, true, 8.0);
 	gCV_Smooth = AutoExecConfig_CreateConVar("gokz_guideline_smooth", "1",
@@ -71,17 +71,17 @@ void GL_CreateConVars()
 	gCV_VerticalBreakDist = AutoExecConfig_CreateConVar("gokz_guideline_vertical_break_dist", "300.0",
 		"双层断点判定距离（units）：相邻两点水平距离 < 64 但垂直距离超过该值视为断点（上下层错位），绘制时断开。", _, true, 100.0, true, 2000.0);
 	gCV_MaxSegments = AutoExecConfig_CreateConVar("gokz_guideline_max_segments", "2000",
-		"完整路线最大绘制线段数上限（保护上限，超出则自动降低平滑迭代仍保持全图）。", _, true, 16.0, true, 5000.0);
+		"完整路线最大线段数上限（保护上限，超出则自动降低平滑迭代；渲染只用到附近窗口）。", _, true, 16.0, true, 5000.0);
 	gCV_ParseBatch = AutoExecConfig_CreateConVar("gokz_guideline_parse_batch", "5000",
 		"录像解析每批处理的帧数（分帧解析防止服务器卡顿）。", _, true, 1000.0, true, 50000.0);
 	gCV_MetaTimeout = AutoExecConfig_CreateConVar("gokz_guideline_meta_timeout", "10",
 		"R2 meta 查询超时（秒）。", _, true, 3.0, true, 60.0);
 	gCV_DownloadTimeout = AutoExecConfig_CreateConVar("gokz_guideline_download_timeout", "30",
 		"R2 录像下载超时（秒）。", _, true, 5.0, true, 120.0);
-	gCV_BatchSize = AutoExecConfig_CreateConVar("gokz_guideline_batch_size", "160",
-		"每渲染周期发送的最大线段数（分批滚动发送，防止一次性发送过多被客户端丢弃；\n		建议 段数/批数×刷新间隔 < beam_lifetime 保证连续显示）。", _, true, 8.0, true, 256.0);
-	gCV_NearDist = AutoExecConfig_CreateConVar("gokz_guideline_near_dist", "2000.0",
-		"玩家附近优先显示距离（units）：距玩家小于该距离的路线段优先发送，\n		保证玩家所在位置附近的路线始终可见（隔批滞后不闪烁）。", _, true, 100.0, true, 10000.0);
+	gCV_BatchSize = AutoExecConfig_CreateConVar("gokz_guideline_batch_size", "96",
+		"每个渲染周期发送线段数的安全上限（窗口内滚动续期的硬顶）。\n		插件会按窗口大小自动换算所需额度（窗口段数×0.15/beam_lifetime），\n		本项仅在自动值过大时兜底；若调得过低（低于自动值）会导致线条闪烁。", _, true, 8.0, true, 256.0);
+	gCV_NearDist = AutoExecConfig_CreateConVar("gokz_guideline_near_dist", "1500.0",
+		"路线显示窗口半径（units）：只绘制玩家前方该距离内（后方取其一半）的路线段。\n		窗口越小开销越低；路线总长不再影响渲染开销。", _, true, 200.0, true, 10000.0);
 
 	AutoExecConfig_ExecuteFile();
 	AutoExecConfig_CleanFile();

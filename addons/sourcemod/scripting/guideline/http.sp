@@ -154,9 +154,8 @@ void GL_OnModeChanged(int client, int newMode)
 
 	// 清空旧线段缓存（防止新模式加载完成前继续显示旧模式路线）
 	GL_ClearSegmentCache();
-	// 重置该玩家附近段缓存（缓存可能属于旧模式）
-	gGL_PlayerNearValid[client] = false;
-	gGL_PlayerNearCount[client] = 0;
+	// 重置该玩家渲染状态（游标/窗口可能属于旧模式）
+	GL_ResetClientRenderState(client);
 
 	// 该模式下已有路线则无虚重复下载（防止来回切模式反复请求）
 	// 但需要立即重建该模式的线段缓存（旧缓存已清空）

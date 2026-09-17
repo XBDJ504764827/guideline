@@ -40,7 +40,7 @@ public Action CommandGL(int client, int args)
 
 	if (newEnabled)
 	{
-		GL_Chat(client, "{lime}路线显示已开启。{grey}（显示最快录像的全图路线，紫色线条）");
+		GL_Chat(client, "{lime}路线显示已开启。{grey}（显示最快录像的附近路线，紫色线条）");
 		// 确保路线加载（已加载则渲染定时器立即显示）
 		GL_EnsureRouteForClient(client);
 	}
